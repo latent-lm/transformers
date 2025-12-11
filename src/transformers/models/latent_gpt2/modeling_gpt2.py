@@ -747,9 +747,9 @@ class GPT2ModelBase(GPT2PreTrainedModel):
 class LanguageEncoder(GPT2ModelBase):
     def __init__(self, config):
         super().__init__(config)
-        self._window_size: int = config.window_size
+        self.__window_size: int = config.window_size
         
-    def pre_process_inputs(
+    def __pre_process_inputs(
         self,
         input_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
@@ -766,7 +766,7 @@ class LanguageEncoder(GPT2ModelBase):
         """
         pass
     
-    def post_process_outputs(
+    def __post_process_outputs(
         self,
         outputs: CausalLMAutoencoderOutputWithCrossAttentions,
     ):
@@ -840,9 +840,9 @@ class LanguageEncoder(GPT2ModelBase):
 class LanguageDecoder(GPT2ModelBase):
     def __init__(self, config):
         super().__init__(config)
-        self._window_size: int = config.window_size
+        self.__window_size: int = config.window_size
         
-    def pre_process_inputs(
+    def __pre_process_inputs(
         self,
         input_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
@@ -859,7 +859,7 @@ class LanguageDecoder(GPT2ModelBase):
         """
         pass
     
-    def post_process_outputs(
+    def __post_process_outputs(
         self,
         outputs: CausalLMAutoencoderOutputWithCrossAttentions,
     ):
