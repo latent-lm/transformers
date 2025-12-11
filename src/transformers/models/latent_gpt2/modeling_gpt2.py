@@ -18,7 +18,7 @@
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -37,6 +37,7 @@ from ...modeling_outputs import (
     QuestionAnsweringModelOutput,
     SequenceClassifierOutputWithPast,
     TokenClassifierOutput,
+    CausalLMAutoencoderOutputWithCrossAttentions,
 )
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from ...pytorch_utils import Conv1D
@@ -543,7 +544,7 @@ class GPT2DoubleHeadsModelOutput(ModelOutput):
 
 
 @auto_docstring
-class GPT2Model(GPT2PreTrainedModel):
+class GPT2ModelBase(GPT2PreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
 
@@ -742,6 +743,191 @@ class GPT2Model(GPT2PreTrainedModel):
             cross_attentions=all_cross_attentions,
         )
 
+@auto_docstring
+class LanguageEncoder(GPT2ModelBase):
+    def __init__(self, config):
+        super().__init__(config)
+        self._window_size: int = config.window_size
+        
+    def pre_process_inputs(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+    ) -> Tuple[torch.LongTensor, torch.FloatTensor]:
+        """
+        Pre-processes and segmnent the inputs for the language encoder.
+
+        Args:
+            input_ids (Optional[torch.LongTensor]): The input ids.
+            inputs_embeds (Optional[torch.FloatTensor]): The input embeddings.
+
+        Returns:
+            A tuple containing the pre-processed input ids and embeddings.
+        """
+        pass
+    
+    def post_process_outputs(
+        self,
+        outputs: CausalLMAutoencoderOutputWithCrossAttentions,
+    ):
+        """
+        Post-processes and segment the outputs of the language encoder.
+
+        Args:
+            outputs: The output of the language encoder.
+
+        Returns:
+            The processed output of the language encoder.
+        """
+        pass
+    
+    @classmethod
+    def build_from_pretrained(
+        cls,
+        pretrained: GPT2ModelBase,
+        window_size: int,
+    ):
+        """
+        Builds a new instance of the LanguageEncoder from a pre-trained model.
+
+        Args:
+            cls: The class to instantiate.
+            pretrained: The pre-trained model to use.
+            window_size: The window size for the language encoder.
+
+        Returns:
+            A new instance of the class.
+        """
+        pass
+        
+    @auto_docstring
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        token_type_ids: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        return_segment: bool = True,
+        **kwargs,
+    ) -> Union[tuple, CausalLMAutoencoderOutputWithCrossAttentions]:
+        output = super().forward(
+            input_ids,
+            past_key_values,
+            cache_position,
+            attention_mask,
+            token_type_ids,
+            position_ids,
+            inputs_embeds,
+            encoder_hidden_states,
+            encoder_attention_mask,
+            use_cache,
+            output_attentions,
+            output_hidden_states,
+            return_dict=True,
+            **kwargs,
+        )
+        
+@auto_docstring
+class LanguageDecoder(GPT2ModelBase):
+    def __init__(self, config):
+        super().__init__(config)
+        self._window_size: int = config.window_size
+        
+    def pre_process_inputs(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+    ) -> Tuple[torch.LongTensor, torch.FloatTensor]:
+        """
+        Pre-processes and segmnent the inputs for the language decoder.
+
+        Args:
+            input_ids (Optional[torch.LongTensor]): The input ids.
+            inputs_embeds (Optional[torch.FloatTensor]): The input embeddings.
+
+        Returns:
+            A tuple containing the pre-processed input ids and embeddings.
+        """
+        pass
+    
+    def post_process_outputs(
+        self,
+        outputs: CausalLMAutoencoderOutputWithCrossAttentions,
+    ):
+        """
+        Post-processes and segment the outputs of the language decoder.
+
+        Args:
+            outputs: The output of the language decoder.
+
+        Returns:
+            The processed output of the language decoder.
+        """
+        pass
+    
+    @classmethod
+    def build_from_pretrained(
+        cls,
+        pretrained: GPT2ModelBase,
+        window_size: int,
+    ):
+        """
+        Builds a new instance of the LanguageEncoder from a pre-trained model.
+
+        Args:
+            cls: The class to instantiate.
+            pretrained: The pre-trained model to use.
+            window_size: The window size for the language decoder.
+
+        Returns:
+            A new instance of the class.
+        """
+        pass
+        
+    @auto_docstring
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        token_type_ids: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        return_segment: bool = True,
+        **kwargs,
+    ) -> Union[tuple, CausalLMAutoencoderOutputWithCrossAttentions]:
+        output = super().forward(
+            input_ids,
+            past_key_values,
+            cache_position,
+            attention_mask,
+            token_type_ids,
+            position_ids,
+            inputs_embeds,
+            encoder_hidden_states,
+            encoder_attention_mask,
+            use_cache,
+            output_attentions,
+            output_hidden_states,
+            return_dict=True,
+            **kwargs,
+        )
 
 @auto_docstring(
     custom_intro="""
@@ -754,7 +940,7 @@ class GPT2LMHeadModel(GPT2PreTrainedModel, GenerationMixin):
 
     def __init__(self, config):
         super().__init__(config)
-        self.transformer = GPT2Model(config)
+        self.transformer = GPT2ModelBase(config)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing
@@ -858,7 +1044,7 @@ class GPT2DoubleHeadsModel(GPT2PreTrainedModel, GenerationMixin):
     def __init__(self, config):
         super().__init__(config)
         config.num_labels = 1
-        self.transformer = GPT2Model(config)
+        self.transformer = GPT2ModelBase(config)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.multiple_choice_head = GPT2SequenceSummary(config)
 
@@ -1001,7 +1187,7 @@ class GPT2ForSequenceClassification(GPT2PreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         self.num_labels = config.num_labels
-        self.transformer = GPT2Model(config)
+        self.transformer = GPT2ModelBase(config)
         self.score = nn.Linear(config.n_embd, self.num_labels, bias=False)
 
         # Initialize weights and apply final processing
@@ -1122,7 +1308,7 @@ class GPT2ForTokenClassification(GPT2PreTrainedModel):
         super().__init__(config)
         self.num_labels = config.num_labels
 
-        self.transformer = GPT2Model(config)
+        self.transformer = GPT2ModelBase(config)
         if hasattr(config, "classifier_dropout") and config.classifier_dropout is not None:
             classifier_dropout = config.classifier_dropout
         elif hasattr(config, "hidden_dropout") and config.hidden_dropout is not None:
@@ -1211,7 +1397,7 @@ class GPT2ForQuestionAnswering(GPT2PreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         self.num_labels = config.num_labels
-        self.transformer = GPT2Model(config)
+        self.transformer = GPT2ModelBase(config)
         self.qa_outputs = nn.Linear(config.hidden_size, 2)
 
         # Initialize weights and apply final processing
@@ -1302,6 +1488,6 @@ __all__ = [
     "GPT2ForSequenceClassification",
     "GPT2ForTokenClassification",
     "GPT2LMHeadModel",
-    "GPT2Model",
+    "GPT2ModelBase",
     "GPT2PreTrainedModel",
 ]
