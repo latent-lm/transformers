@@ -18,7 +18,7 @@
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -744,16 +744,128 @@ class GPT2ModelBase(GPT2PreTrainedModel):
         )
 
 @auto_docstring
-class LanguageEncoder(GPT2ModelBase):
-    def __init__(self, config):
-        super().__init__(config)
-        self.__window_size: int = config.window_size
+class LanguageAutoEncoderBase:
+    def __init__(
+        self,
+        window_size: int,
+        padding_token: Optional[int] = None,
+        padding_embed: Optional[torch.Tensor] = None,
+        wte: Optional[torch.nn.Embedding] = None,
+    ):
+        self.__batch_size: int = None
+        self.__seq_len: int = None
+        self.__segment_num: int = None
         
+        self.__window_size: int = window_size  
+        self.__padding_token = padding_token
+        self.__padding_embed = padding_embed
+        self.__wte: torch.nn.Embedding = wte
+    
+    def __get_padding_embed(self) -> torch.FloatTensor:
+        if self.__padding_embed is None:
+            if self.__wte is None:
+                raise ValueError("To get padding_embed, either provide padding_embed or wte")
+            self.__padding_embed = self.__wte(self.__padding_token)
+        else:
+            return self.__padding_embed
+    def __get_padding_token(self) -> torch.LongTensor:
+        if self.__padding_token is None:
+            raise ValueError("padding_token is not set")
+        return self.__padding_token
+    def __pad(
+        self,
+        sequence: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Pad the given sequence to be a multiple of window_size.
+        
+        If sequence is None, return None.
+        
+        For 2D sequence (batch_size x seq_len), pad with padding_token.
+        For 3D sequence (batch_size x seq_len x embedding_size), pad with padding_embed.
+        
+        Raises:
+            NotImplementedError: If the input dimension is not supported.
+        
+        Returns:
+            torch.Tensor: Padded sequence. Shape is (batch_size, seq_len + pad) if sequence is 2D, otherwise (batch_size, seq_len + pad, embedding_size).
+        """
+        if sequence is None:
+            return sequence
+        batch_size: int = sequence.shape[0]
+        seq_len: int = sequence.shape[1]
+        if sequence.dim() == 2:
+            # input_ids shape: batch_size x seq_len
+            pad_len: int = (self.__window_size - (seq_len % self.__window_size)) % self.__window_size
+            pad = torch.ones((batch_size, pad_len), dtype=sequence.dtype, device=sequence.device) * self.__get_padding_token()
+            padded_sequence = torch.cat((sequence, pad), 1)  # input_ids shape: batch_size x seq_len + pad
+        elif sequence.dim() == 3:
+            # inputs_embeds shape: batch_size x seq_len x embedding size
+            pad_len: int = (self.__window_size - (seq_len % self.__window_size)) % self.__window_size
+            pad = torch.ones((batch_size, pad_len, sequence.shape[2]), dtype=sequence.dtype, device=sequence.device) * self.__get_padding_embed()
+            padded_sequence = torch.cat((sequence, pad), 1)  # input_ids shape: batch_size x seq_len + pad
+        else:
+            raise NotImplementedError(f"Unsupported input dimension: {sequence.dim()} with shape {sequence.shape}")
+        return padded_sequence
+    def __agg_sequence(
+        self,
+        sequence: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Aggregate a sequence into fixed-size windows.
+
+        Args:
+            sequence (Optional[torch.Tensor]): The sequence to split.
+
+        Returns:
+            torch.Tensor: The split sequence.
+        """
+        if sequence is None:
+            return sequence
+        self.__batch_size: int = sequence.shape[0]
+        self.__seq_len: int = sequence.shape[1]
+        padded_sequence = self.__pad(sequence=sequence)
+        self.__segment_num: int = padded_sequence.shape[1] // self.__window_size
+        return padded_sequence.view(self.__batch_size * self.__segment_num, self.__window_size, *padded_sequence.shape[2:])
+    def __split_sequence(
+        self,
+        sequence: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Split a sequence into fixed-size windows.
+
+        Args:
+            sequence (Optional[torch.Tensor]): The sequence to split.
+
+        Returns:
+            torch.Tensor: The split sequence.
+        """
+        if sequence is None:
+            return sequence
+        return sequence.view(self.__batch_size, self.__segment_num, *sequence.shape[1:])
+
+@dataclass
+class PreprocessOutput:
+    input_ids: torch.LongTensor
+    inputs_embeds: torch.FloatTensor
+@auto_docstring
+class LanguageEncoder(GPT2ModelBase):
+    def __init__(self, config, window_size: int):
+        super().__init__(config)
+        self.__window_size: int = window_size
+        self.__ae_base = LanguageAutoEncoderBase(
+            window_size = self.__window_size,
+            padding_token = self.config.pad_token_id,
+            padding_embed = None,
+            wte=self.wte,
+        )
+        # Initialize weights and apply final processing
+        self.post_init()
     def __pre_process_inputs(
         self,
         input_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-    ) -> Tuple[torch.LongTensor, torch.FloatTensor]:
+    ) -> PreprocessOutput:
         """
         Pre-processes and segmnent the inputs for the language encoder.
 
@@ -764,8 +876,11 @@ class LanguageEncoder(GPT2ModelBase):
         Returns:
             A tuple containing the pre-processed input ids and embeddings.
         """
-        pass
-    
+        if input_ids is not None:
+            input_ids = self.__ae_base.__agg_sequence(sequence=input_ids)
+        if inputs_embeds is not None:
+            inputs_embeds = self.__ae_base.__agg_sequence(sequence=inputs_embeds)
+        return PreprocessOutput(input_ids=input_ids, inputs_embeds=inputs_embeds)
     def __post_process_outputs(
         self,
         outputs: CausalLMAutoencoderOutputWithCrossAttentions,
@@ -779,13 +894,16 @@ class LanguageEncoder(GPT2ModelBase):
         Returns:
             The processed output of the language encoder.
         """
-        pass
+        if outputs is None:
+            return outputs
+        return self.__ae_base.__split_sequence(sequence=outputs.last_hidden_state)
     
     @classmethod
     def build_from_pretrained(
         cls,
-        pretrained: GPT2ModelBase,
+        pretrained_model: GPT2ModelBase,
         window_size: int,
+        num_hidden_layers: int,
     ):
         """
         Builds a new instance of the LanguageEncoder from a pre-trained model.
@@ -798,7 +916,18 @@ class LanguageEncoder(GPT2ModelBase):
         Returns:
             A new instance of the class.
         """
-        pass
+        config: GPT2Config = pretrained_model.config.copy()
+        config.num_hidden_layers = num_hidden_layers
+        encoder: LanguageEncoder = cls(config=config, window_size=window_size)
+
+        encoder.wte = pretrained_model.wte
+        encoder.wpe = pretrained_model.wpe
+        encoder.drop = pretrained_model.drop
+        encoder.h = pretrained_model.h[:num_hidden_layers]
+        encoder.ln_f = pretrained_model.ln_f
+        encoder.gradient_checkpointing = pretrained_model.gradient_checkpointing
+        
+        return encoder
         
     @auto_docstring
     def forward(
@@ -819,34 +948,37 @@ class LanguageEncoder(GPT2ModelBase):
         return_segment: bool = True,
         **kwargs,
     ) -> Union[tuple, CausalLMAutoencoderOutputWithCrossAttentions]:
+        pre_process_res: PreprocessOutput = self.__pre_process_inputs(input_ids=input_ids, inputs_embeds=inputs_embeds)
         output = super().forward(
-            input_ids,
-            past_key_values,
-            cache_position,
-            attention_mask,
-            token_type_ids,
-            position_ids,
-            inputs_embeds,
-            encoder_hidden_states,
-            encoder_attention_mask,
-            use_cache,
-            output_attentions,
-            output_hidden_states,
+            input_ids=pre_process_res.input_ids,
+            past_key_values=past_key_values,
+            cache_position=cache_position,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            inputs_embeds=pre_process_res.inputs_embeds,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
             return_dict=True,
             **kwargs,
         )
+        return self.__post_process_outputs(outputs=output)
         
 @auto_docstring
 class LanguageDecoder(GPT2ModelBase):
-    def __init__(self, config):
+    def __init__(self, config, window_size: int):
         super().__init__(config)
-        self.__window_size: int = config.window_size
+        self.__window_size: int = window_size
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         
     def __pre_process_inputs(
         self,
         input_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-    ) -> Tuple[torch.LongTensor, torch.FloatTensor]:
+    ) -> PreprocessOutput:
         """
         Pre-processes and segmnent the inputs for the language decoder.
 
@@ -855,9 +987,9 @@ class LanguageDecoder(GPT2ModelBase):
             inputs_embeds (Optional[torch.FloatTensor]): The input embeddings.
 
         Returns:
-            A tuple containing the pre-processed input ids and embeddings.
+            A PreprocessOutput containing the pre-processed input ids and embeddings.
         """
-        pass
+        return PreprocessOutput(input_ids=input_ids, inputs_embeds=inputs_embeds)
     
     def __post_process_outputs(
         self,
@@ -872,16 +1004,19 @@ class LanguageDecoder(GPT2ModelBase):
         Returns:
             The processed output of the language decoder.
         """
-        pass
+        if outputs is None:
+            return outputs
+        return outputs
     
     @classmethod
     def build_from_pretrained(
         cls,
-        pretrained: GPT2ModelBase,
+        pretrained_model: GPT2ModelBase,
         window_size: int,
+        num_hidden_layers: int,
     ):
         """
-        Builds a new instance of the LanguageEncoder from a pre-trained model.
+        Builds a new instance of the LanguageDecoder from a pre-trained model.
 
         Args:
             cls: The class to instantiate.
@@ -891,7 +1026,18 @@ class LanguageDecoder(GPT2ModelBase):
         Returns:
             A new instance of the class.
         """
-        pass
+        config: GPT2Config = pretrained_model.config.copy()
+        config.num_hidden_layers = num_hidden_layers
+        decoder: LanguageDecoder = cls(config=config, window_size=window_size)
+
+        decoder.wte = pretrained_model.wte
+        decoder.wpe = pretrained_model.wpe
+        decoder.drop = pretrained_model.drop
+        decoder.h = pretrained_model.h[num_hidden_layers:]
+        decoder.ln_f = pretrained_model.ln_f
+        decoder.gradient_checkpointing = pretrained_model.gradient_checkpointing
+        
+        return decoder
         
     @auto_docstring
     def forward(
@@ -910,23 +1056,384 @@ class LanguageDecoder(GPT2ModelBase):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         return_segment: bool = True,
+        do_sample: bool = False,
+        num_beams: int = 1,
+        temperature: float = 1.0,
+        top_k: int = 50,
+        top_p: float = 1.0,
         **kwargs,
     ) -> Union[tuple, CausalLMAutoencoderOutputWithCrossAttentions]:
-        output = super().forward(
-            input_ids,
-            past_key_values,
-            cache_position,
-            attention_mask,
-            token_type_ids,
-            position_ids,
-            inputs_embeds,
-            encoder_hidden_states,
-            encoder_attention_mask,
-            use_cache,
-            output_attentions,
-            output_hidden_states,
+        if input_ids is None:
+            raise ValueError("input_ids must be provided for generation")
+        
+        batch_size = input_ids.shape[0]
+        device = input_ids.device
+        
+        if num_beams > 1:
+            return self._beam_search_generate(
+                input_ids=input_ids,
+                past_key_values=past_key_values,
+                cache_position=cache_position,
+                attention_mask=attention_mask,
+                token_type_ids=token_type_ids,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_attention_mask=encoder_attention_mask,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                return_segment=return_segment,
+                num_beams=num_beams,
+                **kwargs,
+            )
+        else:
+            return self._greedy_generate(
+                input_ids=input_ids,
+                past_key_values=past_key_values,
+                cache_position=cache_position,
+                attention_mask=attention_mask,
+                token_type_ids=token_type_ids,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_attention_mask=encoder_attention_mask,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                return_segment=return_segment,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                **kwargs,
+            )
+    
+    def _greedy_generate(
+        self,
+        input_ids: torch.LongTensor,
+        past_key_values: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        token_type_ids: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        return_segment: bool = True,
+        do_sample: bool = False,
+        temperature: float = 1.0,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        **kwargs,
+    ):
+        batch_size, cur_len = input_ids.shape[:2]
+        device = input_ids.device
+        generated_ids = input_ids.clone()
+        
+        if past_key_values is None and use_cache:
+            past_key_values = DynamicCache()
+            
+        for step in range(self.__window_size):
+            if cur_len + step >= self.__window_size:
+                break
+                
+            model_inputs = {
+                'input_ids': generated_ids,
+                'past_key_values': past_key_values,
+                'cache_position': cache_position,
+                'attention_mask': attention_mask,
+                'token_type_ids': token_type_ids,
+                'position_ids': position_ids,
+                'inputs_embeds': inputs_embeds,
+                'encoder_hidden_states': encoder_hidden_states,
+                'encoder_attention_mask': encoder_attention_mask,
+                'use_cache': use_cache,
+                'output_attentions': output_attentions,
+                'output_hidden_states': output_hidden_states,
+                'return_dict': True,
+            }
+            
+            outputs = super().forward(**model_inputs)
+            hidden_states = outputs.last_hidden_state
+            logits = self.lm_head(hidden_states[:, -1, :])
+            
+            if do_sample:
+                if temperature != 1.0:
+                    logits = logits / temperature
+                
+                if top_k > 0:
+                    indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+                    logits[indices_to_remove] = -float('inf')
+                
+                if top_p < 1.0:
+                    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                    cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+                    sorted_indices_to_remove = cumulative_probs > top_p
+                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                    sorted_indices_to_remove[..., 0] = 0
+                    indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                    logits[indices_to_remove] = -float('inf')
+                
+                probs = torch.softmax(logits, dim=-1)
+                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+            else:
+                next_tokens = torch.argmax(logits, dim=-1)
+                
+            generated_ids = torch.cat([generated_ids, next_tokens.unsqueeze(1)], dim=-1)
+            
+            if use_cache and past_key_values is not None:
+                past_key_values = outputs.past_key_values
+        
+        final_output = super().forward(
+            input_ids=generated_ids,
+            past_key_values=None,
+            cache_position=cache_position,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
+            use_cache=False,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
             return_dict=True,
             **kwargs,
+        )
+        
+        if return_dict:
+            return CausalLMAutoencoderOutputWithCrossAttentions(
+                last_hidden_state=final_output.last_hidden_state,
+                past_key_values=final_output.past_key_values,
+                hidden_states=final_output.hidden_states,
+                attentions=final_output.attentions,
+                cross_attentions=final_output.cross_attentions,
+            )
+        else:
+            return (final_output.last_hidden_state,)
+            
+    def _beam_search_generate(
+        self,
+        input_ids: torch.LongTensor,
+        past_key_values: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        token_type_ids: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        return_segment: bool = True,
+        num_beams: int = 5,
+        **kwargs,
+    ):
+        batch_size, cur_len = input_ids.shape[:2]
+        device = input_ids.device
+        
+        beam_scores = torch.zeros((batch_size, num_beams), dtype=torch.float, device=device)
+        beam_scores[:, 1:] = -1e9
+        beam_scores = beam_scores.view(-1)
+        
+        input_ids = input_ids.unsqueeze(1).expand(batch_size, num_beams, -1).reshape(batch_size * num_beams, -1)
+        
+        for step in range(self.__window_size):
+            if input_ids.shape[-1] >= self.__window_size:
+                break
+                
+            model_inputs = {
+                'input_ids': input_ids,
+                'past_key_values': past_key_values,
+                'cache_position': cache_position,
+                'attention_mask': attention_mask,
+                'token_type_ids': token_type_ids,
+                'position_ids': position_ids,
+                'inputs_embeds': inputs_embeds,
+                'encoder_hidden_states': encoder_hidden_states,
+                'encoder_attention_mask': encoder_attention_mask,
+                'use_cache': use_cache,
+                'output_attentions': output_attentions,
+                'output_hidden_states': output_hidden_states,
+                'return_dict': True,
+            }
+            
+            outputs = super().forward(**model_inputs)
+            hidden_states = outputs.last_hidden_state
+            logits = self.lm_head(hidden_states[:, -1, :])
+            
+            next_token_logits = logits
+            next_token_scores = torch.log_softmax(next_token_logits, dim=-1)
+            
+            next_token_scores_processed = next_token_scores
+            next_token_scores = next_token_scores_processed + beam_scores[:, None].expand_as(next_token_scores)
+            
+            vocab_size = next_token_scores.shape[-1]
+            next_token_scores = next_token_scores.view(batch_size, num_beams * vocab_size)
+            
+            probs = torch.softmax(next_token_scores, dim=-1)
+            next_token_scores, next_tokens = torch.topk(next_token_scores, 2 * num_beams, dim=1, largest=True, sorted=True)
+            
+            next_indices = torch.div(next_tokens, vocab_size, rounding_mode="floor")
+            next_tokens = next_tokens % vocab_size
+            
+            beam_outputs = []
+            beam_scores_new = []
+            beam_tokens = []
+            beam_indices = []
+            
+            for batch_idx in range(batch_size):
+                for beam_token_rank, (next_token, next_score, next_index) in enumerate(
+                    zip(next_tokens[batch_idx], next_token_scores[batch_idx], next_indices[batch_idx])
+                ):
+                    batch_beam_idx = batch_idx * num_beams + next_index
+                    beam_outputs.append(input_ids[batch_beam_idx])
+                    beam_scores_new.append(next_score)
+                    beam_tokens.append(next_token)
+                    beam_indices.append(batch_beam_idx)
+                    
+                    if len(beam_outputs) == num_beams * batch_size:
+                        break
+                if len(beam_outputs) == num_beams * batch_size:
+                    break
+            
+            input_ids = torch.stack(beam_outputs)
+            beam_scores = torch.tensor(beam_scores_new, device=device)
+            beam_tokens = torch.tensor(beam_tokens, device=device).unsqueeze(1)
+            
+            input_ids = torch.cat([input_ids, beam_tokens], dim=-1)
+            
+            if use_cache and past_key_values is not None:
+                past_key_values = outputs.past_key_values
+        
+        best_sequence_idx = beam_scores.view(batch_size, num_beams).argmax(dim=1)
+        best_sequences = []
+        for i, best_idx in enumerate(best_sequence_idx):
+            best_sequences.append(input_ids[i * num_beams + best_idx])
+        
+        best_input_ids = torch.stack(best_sequences)
+        
+        final_output = super().forward(
+            input_ids=best_input_ids,
+            past_key_values=None,
+            cache_position=cache_position,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
+            use_cache=False,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=True,
+            **kwargs,
+        )
+        
+        if return_dict:
+            return CausalLMAutoencoderOutputWithCrossAttentions(
+                last_hidden_state=final_output.last_hidden_state,
+                past_key_values=final_output.past_key_values,
+                hidden_states=final_output.hidden_states,
+                attentions=final_output.attentions,
+                cross_attentions=final_output.cross_attentions,
+            )
+        else:
+            return (final_output.last_hidden_state,)
+
+class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
+    def __init__(self, config, window_size: int):
+        super().__init__(config)
+        self.__window_size: int = window_size
+        self.__encoder: LanguageEncoder = LanguageEncoder(config=config, window_size=window_size)
+        self.__decoder: LanguageDecoder = LanguageDecoder(config=config, window_size=window_size)
+
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        token_type_ids: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        **kwargs,
+    ) -> Union[tuple, CausalLMOutputWithCrossAttentions]:
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        encoder_output = self.__encoder(
+            input_ids=input_ids,
+            past_key_values=past_key_values,
+            attention_mask=attention_mask,
+            cache_position=cache_position,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        # hidden_states = encoder_output[0]
+        decoder_output = self.__decoder(
+            input_ids=None,
+            past_key_values=past_key_values,
+            attention_mask=attention_mask,
+            cache_position=cache_position,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            inputs_embeds=encoder_output.hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=True,
+        )
+
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        logits = self.lm_head(decoder_output.hidden_states[:, slice_indices, :])
+
+        loss = None
+        if labels is not None:
+            # Flatten the tokens
+            loss = self.loss_function(
+                logits,
+                labels,
+                vocab_size=self.config.vocab_size,
+                **kwargs,
+            )
+
+        if not return_dict:
+            output = (logits,) + decoder_output[1:]
+            return ((loss,) + output) if loss is not None else output
+
+        return CausalLMOutputWithCrossAttentions(
+            loss=loss,
+            logits=logits,
+            past_key_values=decoder_output.past_key_values,
+            hidden_states=decoder_output.hidden_states,
+            attentions=decoder_output.attentions,
+            cross_attentions=decoder_output.cross_attentions,
         )
 
 @auto_docstring(
