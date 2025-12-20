@@ -47,6 +47,7 @@ from ...utils import (
     logging,
 )
 from .configuration_gpt2 import GPT2Config
+import copy
 
 
 logger = logging.get_logger(__name__)
@@ -466,7 +467,6 @@ class GPT2SequenceSummary(nn.Module):
         return output
 
 
-@auto_docstring
 class GPT2PreTrainedModel(PreTrainedModel):
     config: GPT2Config
     base_model_prefix = "transformer"
@@ -511,12 +511,13 @@ class GPT2PreTrainedModel(PreTrainedModel):
                     init.normal_(p, mean=0.0, std=self.config.initializer_range / math.sqrt(2 * self.config.n_layer))
 
 
+
+# @auto_docstring(
+#     custom_intro="""
+#     Base class for outputs of models predicting if two sentences are consecutive or not.
+#     """
+# )
 @dataclass
-@auto_docstring(
-    custom_intro="""
-    Base class for outputs of models predicting if two sentences are consecutive or not.
-    """
-)
 class GPT2DoubleHeadsModelOutput(ModelOutput):
     r"""
     loss (`torch.FloatTensor` of shape `(1,)`, *optional*, returned when `labels` is provided):
@@ -543,7 +544,6 @@ class GPT2DoubleHeadsModelOutput(ModelOutput):
     attentions: Optional[tuple[torch.FloatTensor]] = None
 
 
-@auto_docstring
 class GPT2ModelBase(GPT2PreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
@@ -569,7 +569,7 @@ class GPT2ModelBase(GPT2PreTrainedModel):
     def set_input_embeddings(self, new_embeddings):
         self.wte = new_embeddings
 
-    @auto_docstring
+    # @auto_docstring
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -621,6 +621,9 @@ class GPT2ModelBase(GPT2PreTrainedModel):
         else:
             raise ValueError("You have to specify either input_ids or inputs_embeds")
 
+        print("input_ids size: {}".format(input_ids.size()))
+        print("input_ids: {}".format(input_ids))
+
         device = input_ids.device if input_ids is not None else inputs_embeds.device
 
         if token_type_ids is not None:
@@ -654,6 +657,12 @@ class GPT2ModelBase(GPT2PreTrainedModel):
 
         position_embeds = self.wpe(position_ids)
         hidden_states = inputs_embeds + position_embeds.to(inputs_embeds.device)
+
+        print("position_ids size: {}".format(position_ids.size()))
+        print("position_ids: {}".format(position_ids))
+
+        print("attention_mask size: {}".format(attention_mask.size()))
+        print("attention_mask: {}".format(attention_mask))
 
         # Attention mask.
         # ._update_causal_mask() and ._prepare_4d_causal_attention_mask_with_cache_position() copied from LlamaModel
@@ -743,7 +752,7 @@ class GPT2ModelBase(GPT2PreTrainedModel):
             cross_attentions=all_cross_attentions,
         )
 
-@auto_docstring
+# @auto_docstring
 class LanguageAutoEncoderBase:
     def __init__(
         self,
@@ -807,7 +816,7 @@ class LanguageAutoEncoderBase:
         else:
             raise NotImplementedError(f"Unsupported input dimension: {sequence.dim()} with shape {sequence.shape}")
         return padded_sequence
-    def __agg_sequence(
+    def agg_sequence(
         self,
         sequence: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -827,7 +836,7 @@ class LanguageAutoEncoderBase:
         padded_sequence = self.__pad(sequence=sequence)
         self.__segment_num: int = padded_sequence.shape[1] // self.__window_size
         return padded_sequence.view(self.__batch_size * self.__segment_num, self.__window_size, *padded_sequence.shape[2:])
-    def __split_sequence(
+    def split_sequence(
         self,
         sequence: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -848,7 +857,7 @@ class LanguageAutoEncoderBase:
 class PreprocessOutput:
     input_ids: torch.LongTensor
     inputs_embeds: torch.FloatTensor
-@auto_docstring
+# @auto_docstring
 class LanguageEncoder(GPT2ModelBase):
     def __init__(self, config, window_size: int):
         super().__init__(config)
@@ -877,9 +886,9 @@ class LanguageEncoder(GPT2ModelBase):
             A tuple containing the pre-processed input ids and embeddings.
         """
         if input_ids is not None:
-            input_ids = self.__ae_base.__agg_sequence(sequence=input_ids)
+            input_ids = self.__ae_base.agg_sequence(sequence=input_ids)
         if inputs_embeds is not None:
-            inputs_embeds = self.__ae_base.__agg_sequence(sequence=inputs_embeds)
+            inputs_embeds = self.__ae_base.agg_sequence(sequence=inputs_embeds)
         return PreprocessOutput(input_ids=input_ids, inputs_embeds=inputs_embeds)
     def __post_process_outputs(
         self,
@@ -896,7 +905,7 @@ class LanguageEncoder(GPT2ModelBase):
         """
         if outputs is None:
             return outputs
-        return self.__ae_base.__split_sequence(sequence=outputs.last_hidden_state)
+        return self.__ae_base.split_sequence(sequence=outputs.last_hidden_state)
     
     @classmethod
     def build_from_pretrained(
@@ -916,7 +925,7 @@ class LanguageEncoder(GPT2ModelBase):
         Returns:
             A new instance of the class.
         """
-        config: GPT2Config = pretrained_model.config.copy()
+        config: GPT2Config = copy.deepcopy(pretrained_model.config)
         config.num_hidden_layers = num_hidden_layers
         encoder: LanguageEncoder = cls(config=config, window_size=window_size)
 
@@ -929,7 +938,7 @@ class LanguageEncoder(GPT2ModelBase):
         
         return encoder
         
-    @auto_docstring
+    # @auto_docstring
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -949,11 +958,12 @@ class LanguageEncoder(GPT2ModelBase):
         **kwargs,
     ) -> Union[tuple, CausalLMAutoencoderOutputWithCrossAttentions]:
         pre_process_res: PreprocessOutput = self.__pre_process_inputs(input_ids=input_ids, inputs_embeds=inputs_embeds)
+        pre_process_atten: PreprocessOutput = self.__pre_process_inputs(input_ids=attention_mask, inputs_embeds=None)
         output = super().forward(
             input_ids=pre_process_res.input_ids,
             past_key_values=past_key_values,
             cache_position=cache_position,
-            attention_mask=attention_mask,
+            attention_mask=pre_process_atten.input_ids,
             token_type_ids=token_type_ids,
             position_ids=position_ids,
             inputs_embeds=pre_process_res.inputs_embeds,
@@ -967,7 +977,7 @@ class LanguageEncoder(GPT2ModelBase):
         )
         return self.__post_process_outputs(outputs=output)
         
-@auto_docstring
+# @auto_docstring
 class LanguageDecoder(GPT2ModelBase):
     def __init__(self, config, window_size: int):
         super().__init__(config)
@@ -1026,7 +1036,7 @@ class LanguageDecoder(GPT2ModelBase):
         Returns:
             A new instance of the class.
         """
-        config: GPT2Config = pretrained_model.config.copy()
+        config: GPT2Config = copy.deepcopy(pretrained_model.config)
         config.num_hidden_layers = num_hidden_layers
         decoder: LanguageDecoder = cls(config=config, window_size=window_size)
 
@@ -1039,7 +1049,7 @@ class LanguageDecoder(GPT2ModelBase):
         
         return decoder
         
-    @auto_docstring
+    # @auto_docstring
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -1354,8 +1364,40 @@ class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
     def __init__(self, config, window_size: int):
         super().__init__(config)
         self.__window_size: int = window_size
-        self.__encoder: LanguageEncoder = LanguageEncoder(config=config, window_size=window_size)
-        self.__decoder: LanguageDecoder = LanguageDecoder(config=config, window_size=window_size)
+        # self.encoder: LanguageEncoder = LanguageEncoder(config=config, window_size=window_size)
+        # self.decoder: LanguageDecoder = LanguageDecoder(config=config, window_size=window_size)
+
+    @classmethod
+    def build_from_pretrained(
+        cls,
+        pretrained_model,
+        window_size: int,
+        num_hidden_layers_encoder: int,
+        num_hidden_layers_decoder: int,
+        # distributed_type: str,
+    ):
+        # import pdb; pdb.set_trace()
+        # print("{}".format(pretrained_model))
+
+        config: GPT2Config = copy.deepcopy(pretrained_model.config)
+        # config.num_hidden_layers = num_hidden_layers
+        # if distributed_type == "DEEPSPEED":
+        #     config.device_map
+        model = cls(config, window_size)
+
+        model.encoder: LanguageEncoder = LanguageEncoder.build_from_pretrained(
+            pretrained_model,
+            window_size,
+            num_hidden_layers_encoder
+        )
+        model.decoder: LanguageDecoder = LanguageDecoder.build_from_pretrained(
+            pretrained_model,
+            window_size,
+            num_hidden_layers_decoder
+        )
+        model.lm_head = model.decoder.lm_head
+
+        return model
 
     def forward(
         self,
@@ -1378,7 +1420,7 @@ class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
     ) -> Union[tuple, CausalLMOutputWithCrossAttentions]:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        encoder_output = self.__encoder(
+        encoder_output = self.encoder(
             input_ids=input_ids,
             past_key_values=past_key_values,
             attention_mask=attention_mask,
@@ -1394,7 +1436,7 @@ class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
             return_dict=True,
         )
         # hidden_states = encoder_output[0]
-        decoder_output = self.__decoder(
+        decoder_output = self.decoder(
             input_ids=None,
             past_key_values=past_key_values,
             attention_mask=attention_mask,
@@ -1436,12 +1478,12 @@ class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
             cross_attentions=decoder_output.cross_attentions,
         )
 
-@auto_docstring(
-    custom_intro="""
-    The GPT2 Model transformer with a language modeling head on top (linear layer with weights tied to the input
-    embeddings).
-    """
-)
+# @auto_docstring(
+#     custom_intro="""
+#     The GPT2 Model transformer with a language modeling head on top (linear layer with weights tied to the input
+#     embeddings).
+#     """
+# )
 class GPT2LMHeadModel(GPT2PreTrainedModel, GenerationMixin):
     _tied_weights_keys = {"lm_head.weight": "transformer.wte.weight"}
 
@@ -1453,7 +1495,7 @@ class GPT2LMHeadModel(GPT2PreTrainedModel, GenerationMixin):
         # Initialize weights and apply final processing
         self.post_init()
 
-    @auto_docstring
+    # @auto_docstring
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -1537,14 +1579,14 @@ class GPT2LMHeadModel(GPT2PreTrainedModel, GenerationMixin):
         )
 
 
-@auto_docstring(
-    custom_intro="""
-        The GPT2 Model transformer with a language modeling and a multiple-choice classification head on top e.g. for
-    RocStories/SWAG tasks. The two heads are two linear layers. The language modeling head has its weights tied to the
-    input embeddings, the classification head takes as input the input of a specified classification token index in the
-    input sequence).
-    """
-)
+# @auto_docstring(
+#     custom_intro="""
+#         The GPT2 Model transformer with a language modeling and a multiple-choice classification head on top e.g. for
+#     RocStories/SWAG tasks. The two heads are two linear layers. The language modeling head has its weights tied to the
+#     input embeddings, the classification head takes as input the input of a specified classification token index in the
+#     input sequence).
+#     """
+# )
 class GPT2DoubleHeadsModel(GPT2PreTrainedModel, GenerationMixin):
     _tied_weights_keys = {"lm_head.weight": "transformer.wte.weight"}
 
@@ -1558,7 +1600,7 @@ class GPT2DoubleHeadsModel(GPT2PreTrainedModel, GenerationMixin):
         # Initialize weights and apply final processing
         self.post_init()
 
-    @auto_docstring
+    # @auto_docstring
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -1676,20 +1718,20 @@ class GPT2DoubleHeadsModel(GPT2PreTrainedModel, GenerationMixin):
         )
 
 
-@auto_docstring(
-    custom_intro="""
-    The GPT2 Model transformer with a sequence classification head on top (linear layer).
+# @auto_docstring(
+#     custom_intro="""
+#     The GPT2 Model transformer with a sequence classification head on top (linear layer).
 
-    [`GPT2ForSequenceClassification`] uses the last token in order to do the classification, as other causal models
-    (e.g. GPT-1) do.
+#     [`GPT2ForSequenceClassification`] uses the last token in order to do the classification, as other causal models
+#     (e.g. GPT-1) do.
 
-    Since it does classification on the last token, it requires to know the position of the last token. If a
-    `pad_token_id` is defined in the configuration, it finds the last token that is not a padding token in each row. If
-    no `pad_token_id` is defined, it simply takes the last value in each row of the batch. Since it cannot guess the
-    padding tokens when `inputs_embeds` are passed instead of `input_ids`, it does the same (take the last value in
-    each row of the batch).
-    """
-)
+#     Since it does classification on the last token, it requires to know the position of the last token. If a
+#     `pad_token_id` is defined in the configuration, it finds the last token that is not a padding token in each row. If
+#     no `pad_token_id` is defined, it simply takes the last value in each row of the batch. Since it cannot guess the
+#     padding tokens when `inputs_embeds` are passed instead of `input_ids`, it does the same (take the last value in
+#     each row of the batch).
+#     """
+# )
 class GPT2ForSequenceClassification(GPT2PreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
@@ -1700,7 +1742,7 @@ class GPT2ForSequenceClassification(GPT2PreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
-    @auto_docstring
+    # @auto_docstring
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -1809,7 +1851,7 @@ class GPT2ForSequenceClassification(GPT2PreTrainedModel):
         )
 
 
-@auto_docstring
+# @auto_docstring
 class GPT2ForTokenClassification(GPT2PreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
@@ -1828,7 +1870,7 @@ class GPT2ForTokenClassification(GPT2PreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
-    @auto_docstring
+    # @auto_docstring
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -1899,7 +1941,7 @@ class GPT2ForTokenClassification(GPT2PreTrainedModel):
         )
 
 
-@auto_docstring
+# @auto_docstring
 class GPT2ForQuestionAnswering(GPT2PreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
@@ -1910,7 +1952,7 @@ class GPT2ForQuestionAnswering(GPT2PreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
-    @auto_docstring
+    # @auto_docstring
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
