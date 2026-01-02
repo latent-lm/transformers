@@ -1343,7 +1343,160 @@ class LanguageEncoderLMHead(GPT2PreTrainedModel, GenerationMixin):
             cross_attentions=transformer_outputs.cross_attentions,
             latents=transformer_outputs.last_tail_hidden_state,
         )
+
+
+class LatentAR(GPT2ModelBase):
+    def __init__(self, config: LatentGPT2Config):
+        super().__init__(config)
+        self.ae_base = LanguageEncoderBase(
+            window_size = config.window_size,
+            padding_token = config.pad_token_id,
+            # padding_token = self.config.eos_token_id,
+            padding_embed = None,
+            wte=self.wte,
+        )
+        # Initialize weights and apply final processing
+        self.post_init()
+    def __pre_process_inputs(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+    ) -> PreprocessOutput:
+        """
+        Pre-processes and segments the inputs for the language encoder.
+
+        Args:
+            input_ids (Optional[torch.LongTensor]): The input ids.
+            inputs_embeds (Optional[torch.FloatTensor]): The input embeddings.
+
+        Returns:
+            A tuple containing the pre-processed input ids and embeddings.
+        """
+        # if input_ids is not None:
+        #     input_ids = self.ae_base.agg_sequence(sequence=input_ids)
+        # if inputs_embeds is not None:
+        #     inputs_embeds = self.ae_base.agg_sequence(sequence=inputs_embeds)
+        # return PreprocessOutput(input_ids=input_ids, inputs_embeds=inputs_embeds)
+
+        # No need to aggregated again
+        return PreprocessOutput(input_ids=input_ids, inputs_embeds=inputs_embeds)
+
+
+    def __post_process_outputs(
+        self,
+        outputs: BaseModelOutputWithPastAndCrossAttentions,
+    ) -> BaseAutoencoderOutputWithPastAndCrossAttentions:
+        """
+        Post-processes and segment the outputs of the language encoder.
+
+        Args:
+            outputs: The output of the language encoder.
+
+        Returns:
+            The processed output of the language encoder.
+        """
+        if outputs is None:
+            return outputs
+        return BaseAutoencoderOutputWithPastAndCrossAttentions(
+            last_tail_hidden_state=outputs.last_hidden_state),
+            last_hidden_state=outputs.last_hidden_state,
+            past_key_values=outputs.past_key_values,
+            hidden_states=tuple(hidden_state for hidden_state in outputs.hidden_states) if outputs.hidden_states is not None else None,
+            # TODO: Handle attentions and cross_attentions reshaping
+            attentions=outputs.attentions,
+            cross_attentions=outputs.cross_attentions,
+        )
+
+    def init_weight_from_pretrained(self, pretrained_model: GPT2ModelBase):
+        """
+        Initializes the language encoder from a pre-trained model.
+
+        Args:
+            pretrained_model: The pre-trained model to use.
+
+        Returns:
+            A new instance of the class.
+        """
+        self.wte = copy.deepcopy(pretrained_model.wte)
+        self.wpe = copy.deepcopy(pretrained_model.wpe)
+        self.drop = copy.deepcopy(pretrained_model.drop)
+        self.h = copy.deepcopy(pretrained_model.h[self.config.num_hidden_layers_encoder:-self.config.num_hidden_layers_encoder])
+        self.ln_f = copy.deepcopy(pretrained_model.ln_f)
+        self.gradient_checkpointing = pretrained_model.gradient_checkpointing
+        return self
+    
+    # @classmethod
+    # def build_from_pretrained(
+    #     cls,
+    #     pretrained_model: GPT2ModelBase,
+    #     window_size: int,
+    #     num_hidden_layers: int,
+    # ):
+    #     """
+    #     Builds a new instance of the LanguageEncoder from a pre-trained model.
+
+    #     Args:
+    #         cls: The class to instantiate.
+    #         pretrained: The pre-trained model to use.
+    #         window_size: The window size for the language encoder.
+
+    #     Returns:
+    #         A new instance of the class.
+    #     """
+    #     config: LatentGPT2Config = copy.deepcopy(pretrained_model.config)
+    #     config.num_hidden_layers = num_hidden_layers
+    #     encoder: LanguageEncoder = cls(config=config, window_size=window_size)
+
+    #     encoder.wte = copy.deepcopy(pretrained_model.wte)
+    #     encoder.wpe = copy.deepcopy(pretrained_model.wpe)
+    #     encoder.drop = copy.deepcopy(pretrained_model.drop)
+    #     encoder.h = copy.deepcopy(pretrained_model.h[:num_hidden_layers])
+    #     encoder.ln_f = copy.deepcopy(pretrained_model.ln_f)
+    #     encoder.gradient_checkpointing = pretrained_model.gradient_checkpointing
+
+    #     return encoder
         
+    @auto_docstring(
+        custom_args="return_segment (`bool`, *optional*, defaults to `True`): Whether to return segmented outputs.",
+    )
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        token_type_ids: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        return_segment: bool = True,
+        **kwargs,
+    ) -> Union[tuple, BaseAutoencoderOutputWithPastAndCrossAttentions]:
+        pre_process_res: PreprocessOutput = self.__pre_process_inputs(input_ids=input_ids, inputs_embeds=inputs_embeds)
+        output = super().forward(
+            input_ids=None,
+            past_key_values=past_key_values,
+            cache_position=cache_position,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            inputs_embeds=pre_process_res.inputs_embeds,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=True,
+            **kwargs,
+        )
+        return self.__post_process_outputs(outputs=output)
+
+
 @auto_docstring(
     custom_intro="Language decoder model based on GPT-2 for decoding latent representations back to text.",
     custom_args="window_size (`int`): The window size for disaggregating latent representations back to sequences.",
@@ -1683,6 +1836,17 @@ class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
         # Initialize weights and apply final processing
         self.post_init()
 
+        self.ltar: LatentAR = LatentAR(config=config)
+
+        self.fm: FlowMatchingModel = FlowMatchingModel(
+            hidden_dim = config.n_embd,
+            semantic_dim = config.n_embd,
+            time_embed_dim = 256,
+            num_layers = 4,
+            num_heads = 8,
+            dropout = 0.1
+        )
+
     def init_weight_from_pretrained(self, pretrained_model: GPT2LMHeadModel):
         """
         Initializes the language encoder from a pre-trained model.
@@ -1695,6 +1859,9 @@ class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
         """
         self.encoder.init_weight_from_pretrained(pretrained_model=pretrained_model)
         self.decoder.init_weight_from_pretrained(pretrained_model=pretrained_model)
+
+        self.ltar.init_weight_from_pretrained(pretrained_model=pretrained_model)
+
         return self
 
     # @classmethod
@@ -1750,7 +1917,11 @@ class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
+<<<<<<< HEAD
         use_latent_ar: bool = False,
+=======
+        use_latent_ar: Optional[bool] = None,
+>>>>>>> f4f8d21e5f (Add AR and FM support)
         **kwargs,
     ) -> Union[tuple, CausalLMAutoencoderOutputWithCrossAttentions]:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
@@ -1778,24 +1949,48 @@ class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
             output_hidden_states=True,
             return_dict=True,
         )
+
+
+        if use_latent_ar:
+            ltar_output = self.ltar(
+                input_ids=input_ids,
+                past_key_values=past_key_values,
+                attention_mask=attention_mask,
+                cache_position=cache_position,
+                token_type_ids=token_type_ids,
+                position_ids=position_ids,
+                inputs_embeds=encoder_output.last_tail_hidden_state,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_attention_mask=encoder_attention_mask,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+
+            # hidden_size = ltar_output.last_tail_hidden_state.size(-1)
+            fm_output = self.fm.sample(ltar_output.last_tail_hidden_state, num_steps=100)
+            # fm_output = fm_output.reshape(ltar_output.last_tail_hidden_state.size())
+
+
         # hidden_states = encoder_output[0]
         decoder_output = self.decoder(
             input_ids=None,
-            # past_key_values=past_key_values,
-            # attention_mask=attention_mask,
-            # cache_position=cache_position,
-            # token_type_ids=token_type_ids,
-            # position_ids=position_ids,
-            past_key_values=None,
-            attention_mask=None,
-            cache_position=None,
-            token_type_ids=None,
-            position_ids=None,
-            inputs_embeds=encoder_output.last_tail_hidden_state,
-            # encoder_hidden_states=encoder_hidden_states,
-            # encoder_attention_mask=encoder_attention_mask,
-            encoder_hidden_states=None,
-            encoder_attention_mask=None,
+            past_key_values=past_key_values,
+            attention_mask=attention_mask,
+            cache_position=cache_position,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            # past_key_values=None,
+            # attention_mask=None,
+            # cache_position=None,
+            # token_type_ids=None,
+            # position_ids=None,
+            inputs_embeds=fm_output if use_latent_ar else encoder_output.last_tail_hidden_state,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
+            # encoder_hidden_states=None,
+            # encoder_attention_mask=None,
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -1835,18 +2030,25 @@ class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
 
         if not return_dict:
             output = (logits,) + decoder_output[1:]
+            if use_latent_ar:
+                output = output + (ltar_output, encoder_output)
             return ((loss,) + output) if loss is not None else output
 
-        return CausalLMAutoencoderOutputWithCrossAttentions(
-            last_tail_hidden_state=decoder_output.last_tail_hidden_state,
-            last_hidden_state=decoder_output.last_hidden_state,
-            loss=loss,
-            logits=logits,
-            past_key_values=decoder_output.past_key_values,
-            hidden_states=decoder_output.hidden_states,
-            attentions=decoder_output.attentions,
-            cross_attentions=decoder_output.cross_attentions,
-        )
+        if return_dict:
+
+            res = CausalLMAutoencoderOutputWithCrossAttentions(
+                last_tail_hidden_state=decoder_output.last_tail_hidden_state,
+                last_hidden_state=decoder_output.last_hidden_state,
+                loss=loss,
+                logits=logits,
+                past_key_values=decoder_output.past_key_values,
+                hidden_states=decoder_output.hidden_states,
+                attentions=decoder_output.attentions,
+                cross_attentions=decoder_output.cross_attentions,
+            )
+            if use_latent_ar:
+                return (res, ltar_output, encoder_output)
+            return res
 
 # @auto_docstring(
 #     custom_intro="""

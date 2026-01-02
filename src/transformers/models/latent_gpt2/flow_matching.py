@@ -115,6 +115,10 @@ class FlowMatchingModel(nn.Module):
         Returns:
             Final semantic space points, shape (batch_size, semantic_dim)
         """
+        original_size = condition.size()
+        hidden_size = original_size[-1]
+        condition = condition.reshape(-1, hidden_size)
+
         batch_size = condition.shape[0]
         device = condition.device
         
@@ -140,6 +144,7 @@ class FlowMatchingModel(nn.Module):
             else:
                 raise ValueError(f"Unknown method: {method}")
         
+        x = x.reshape(original_size)
         return x
     
     # TODO: Modify this
