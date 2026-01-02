@@ -1047,7 +1047,10 @@ class PreprocessOutput:
     input_ids: torch.LongTensor
     inputs_embeds: torch.FloatTensor
 
-@auto_docstring(custom_intro="Language encoder model based on GPT-2 for encoding text into latent representations.")
+@auto_docstring(
+    custom_intro="Language encoder model based on GPT-2 for encoding text into latent representations.",
+    custom_args="window_size (`int`): The window size for aggregating input sequences into segments.",
+)
 class LanguageEncoder(GPT2ModelBase):
     def __init__(self, config, window_size: int):
         super().__init__(config)
@@ -1140,7 +1143,9 @@ class LanguageEncoder(GPT2ModelBase):
 
         return encoder
         
-    @auto_docstring
+    @auto_docstring(
+        custom_args="return_segment (`bool`, *optional*, defaults to `True`): Whether to return segmented outputs.",
+    )
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -1308,7 +1313,10 @@ class LanguageEncoderLMHead(GPT2PreTrainedModel, GenerationMixin):
             latents=transformer_outputs.last_tail_hidden_state,
         )
         
-@auto_docstring(custom_intro="Language decoder model based on GPT-2 for decoding latent representations back to text.")
+@auto_docstring(
+    custom_intro="Language decoder model based on GPT-2 for decoding latent representations back to text.",
+    custom_args="window_size (`int`): The window size for disaggregating latent representations back to sequences.",
+)
 class LanguageDecoder(GPT2ModelBase):
     def __init__(self, config, window_size: int):
         super().__init__(config)
