@@ -4,7 +4,7 @@ import torch
 
 from ...cache_utils import Cache
 from ...generation import GenerationMixin
-from ...modeling_outputs import CausalLMAutoencoderOutputWithCrossAttentions
+from ...modeling_outputs import LatentCausalLMOutputWithCrossAttentions
 from .configuration_latent_gpt2 import LatentGPT2Config
 from .modeling_gpt2 import LanguageAutoencoder, GPT2PreTrainedModel
 from .flow_matching import FlowMatchingModel
@@ -52,7 +52,7 @@ class LatnetAutoregressive(GPT2PreTrainedModel, GenerationMixin):
         logits_to_keep: Union[int, torch.Tensor] = 0,
         use_latent_ar: bool = False,
         **kwargs,
-    ) -> Union[tuple, CausalLMAutoencoderOutputWithCrossAttentions]:
+    ) -> Union[tuple, LatentCausalLMOutputWithCrossAttentions]:
         if use_latent_ar:
             raise NotImplementedError("Haven't incorporated flow matching model yet.")
         else:
