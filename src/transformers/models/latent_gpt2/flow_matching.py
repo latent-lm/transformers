@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-
+from configuration_latent_gpt2 import LatentGPT2Config
 
 class FlowMatchingModel(nn.Module):
     """
@@ -12,12 +12,13 @@ class FlowMatchingModel(nn.Module):
     
     def __init__(
         self,
-        hidden_dim: int,
-        semantic_dim: int,
-        time_embed_dim: int = 256,
-        num_layers: int = 4,
-        num_heads: int = 8,
-        dropout: float = 0.1
+        config: LatentGPT2Config,
+        # hidden_dim: int,
+        # semantic_dim: int,
+        # time_embed_dim: int = 256,
+        # num_layers: int = 4,
+        # num_heads: int = 8,
+        # dropout: float = 0.1
     ):
         """
         Args:
@@ -30,27 +31,27 @@ class FlowMatchingModel(nn.Module):
         """
         super().__init__()
         
-        self.hidden_dim = hidden_dim
-        self.semantic_dim = semantic_dim
-        self.time_embed_dim = time_embed_dim
+        self.hidden_dim = config.fm_hidden_dim
+        self.semantic_dim = config.fm_semantic_dim
+        self.time_embed_dim = config.fm_time_embed_dim
         
         # Time embedding network (sinusoidal + MLP)
         self.time_mlp = nn.Sequential(
-            nn.Linear(time_embed_dim, time_embed_dim * 4),
+            nn.Linear(self.time_embed_dim, self.time_embed_dim * 4),
             nn.SiLU(),
-            nn.Linear(time_embed_dim * 4, time_embed_dim)
+            nn.Linear(self.time_embed_dim * 4, self.time_embed_dim)
         )
         
         # Project hidden state to semantic dimension
-        self.hidden_proj = nn.Linear(hidden_dim, semantic_dim)
+        self.hidden_proj = nn.Linear(self.hidden_dim, self.semantic_dim)
         
         # Flow velocity network (predicts dx/dt)
         self.velocity_net = VelocityNetwork(
-            semantic_dim=semantic_dim,
-            time_embed_dim=time_embed_dim,
-            num_layers=num_layers,
-            num_heads=num_heads,
-            dropout=dropout
+            semantic_dim=self.semantic_dim,
+            time_embed_dim=self.time_embed_dim,
+            num_layers=config.fm_num_layers,
+            num_heads=config.fm_num_heads,
+            dropout=config.fm_dropout
         )
         
     def get_time_embedding(self, t: torch.Tensor) -> torch.Tensor:

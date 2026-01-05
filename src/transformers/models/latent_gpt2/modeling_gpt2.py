@@ -1839,12 +1839,7 @@ class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
         self.ltar: LatentAR = LatentAR(config=config)
 
         self.fm: FlowMatchingModel = FlowMatchingModel(
-            hidden_dim = config.n_embd,
-            semantic_dim = config.n_embd,
-            time_embed_dim = 256,
-            num_layers = 4,
-            num_heads = 8,
-            dropout = 0.1
+            config = config,
         )
 
     def init_weight_from_pretrained(self, pretrained_model: GPT2LMHeadModel):

@@ -154,6 +154,12 @@ class LatentGPT2Config(GPT2Config):
         num_hidden_layers_encoder=6,
         num_hidden_layers_decoder=6,
         pad_token_id=50256,
+        fm_hidden_dim=768,
+        fm_semantic_dim=768,
+        fm_time_embed_dim=256,
+        fm_num_layers=4,
+        fm_num_heads=8,
+        fm_dropout=0.1,
         **kwargs,
     ):
         super().__init__(
