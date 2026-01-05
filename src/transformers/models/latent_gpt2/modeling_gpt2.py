@@ -1917,11 +1917,7 @@ class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-<<<<<<< HEAD
-        use_latent_ar: bool = False,
-=======
         use_latent_ar: Optional[bool] = None,
->>>>>>> f4f8d21e5f (Add AR and FM support)
         **kwargs,
     ) -> Union[tuple, CausalLMAutoencoderOutputWithCrossAttentions]:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
