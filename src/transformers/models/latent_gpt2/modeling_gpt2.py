@@ -845,8 +845,53 @@ class GPT2LMHeadModel(GPT2PreTrainedModel, GenerationMixin):
             cross_attentions=transformer_outputs.cross_attentions,
         )
 
+@auto_docstring(
+    custom_intro="Base encoder model for language encoding with configurable number of layers.",
+)
+class LanguageEncoderBase(GPT2ModelBase):
+    def __init__(self, config: LatentGPT2Config):
+        super().__init__(config)
+
+        self.embed_dim = config.hidden_size
+
+        self.wte = nn.Embedding(config.vocab_size, self.embed_dim)
+        self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
+
+        self.drop = nn.Dropout(config.embd_pdrop)
+        self.h = nn.ModuleList([GPT2Block(config, layer_idx=i) for i in range(config.num_hidden_layers_encoder)])
+        self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
+
+        self.gradient_checkpointing = False
+        self._attn_implementation = config._attn_implementation
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+
+@auto_docstring(
+    custom_intro="Base decoder model for language decoding with configurable number of layers.",
+)
+class LanguageDecoderBase(GPT2ModelBase):
+    def __init__(self, config: LatentGPT2Config):
+        super().__init__(config)
+
+        self.embed_dim = config.hidden_size
+
+        self.wte = nn.Embedding(config.vocab_size, self.embed_dim)
+        self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
+
+        self.drop = nn.Dropout(config.embd_pdrop)
+        self.h = nn.ModuleList([GPT2Block(config, layer_idx=i) for i in range(config.num_hidden_layers_decoder)])
+        self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
+
+        self.gradient_checkpointing = False
+        self._attn_implementation = config._attn_implementation
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
 @auto_docstring(custom_intro="Base class for language encoding with fixed-size window aggregation.")
-class LanguageEncoderBase:
+class LanguageEncoderUtils:
     def __init__(
         self,
         window_size: int,
@@ -964,7 +1009,7 @@ class LanguageEncoderBase:
         return sequence.view(self.__batch_size, self.__segment_num * sequence.shape[1], *sequence.shape[2:])
     
 @auto_docstring(custom_intro="Base class for language decoding with fixed-size window disaggregation.")
-class LanguageDecoderBase:
+class LanguageDecoderUtils:
     def __init__(
         self,
         window_size: int,
@@ -1051,10 +1096,10 @@ class PreprocessOutput:
     custom_intro="Language encoder model based on GPT-2 for encoding text into latent representations.",
     custom_args="window_size (`int`): The window size for aggregating input sequences into segments.",
 )
-class LanguageEncoder(GPT2ModelBase):
+class LanguageEncoder(LanguageEncoderBase):
     def __init__(self, config: LatentGPT2Config):
         super().__init__(config)
-        self.ae_base = LanguageEncoderBase(
+        self.ae_utils = LanguageEncoderUtils(
             window_size = config.window_size,
             padding_token = config.pad_token_id,
             # padding_token = self.config.eos_token_id,
@@ -1079,9 +1124,9 @@ class LanguageEncoder(GPT2ModelBase):
             A tuple containing the pre-processed input ids and embeddings.
         """
         if input_ids is not None:
-            input_ids = self.ae_base.agg_sequence(sequence=input_ids)
+            input_ids = self.ae_utils.agg_sequence(sequence=input_ids)
         if inputs_embeds is not None:
-            inputs_embeds = self.ae_base.agg_sequence(sequence=inputs_embeds)
+            inputs_embeds = self.ae_utils.agg_sequence(sequence=inputs_embeds)
         return PreprocessOutput(input_ids=input_ids, inputs_embeds=inputs_embeds)
     def __post_process_outputs(
         self,
@@ -1102,10 +1147,10 @@ class LanguageEncoder(GPT2ModelBase):
         logits_to_keep: int = 1
         slice_indices = slice(-logits_to_keep, None, None)
         return BaseAutoencoderOutputWithPastAndCrossAttentions(
-            last_tail_hidden_state=self.ae_base.split_sequence(sequence=outputs.last_hidden_state[:, slice_indices, :]),
-            last_hidden_state=self.ae_base.split_sequence(sequence=outputs.last_hidden_state),
+            last_tail_hidden_state=self.ae_utils.split_sequence(sequence=outputs.last_hidden_state[:, slice_indices, :]),
+            last_hidden_state=self.ae_utils.split_sequence(sequence=outputs.last_hidden_state),
             past_key_values=outputs.past_key_values,
-            hidden_states=tuple(self.ae_base.split_sequence(sequence=hidden_state) for hidden_state in outputs.hidden_states) if outputs.hidden_states is not None else None,
+            hidden_states=tuple(self.ae_utils.split_sequence(sequence=hidden_state) for hidden_state in outputs.hidden_states) if outputs.hidden_states is not None else None,
             # TODO: Handle attentions and cross_attentions reshaping
             attentions=outputs.attentions,
             cross_attentions=outputs.cross_attentions,
@@ -1348,10 +1393,10 @@ class LanguageEncoderLMHead(GPT2PreTrainedModel, GenerationMixin):
     custom_intro="Language decoder model based on GPT-2 for decoding latent representations back to text.",
     custom_args="window_size (`int`): The window size for disaggregating latent representations back to sequences.",
 )
-class LanguageDecoder(GPT2ModelBase):
+class LanguageDecoder(LanguageDecoderBase):
     def __init__(self, config: LatentGPT2Config):
         super().__init__(config)
-        self.ae_base = LanguageDecoderBase(
+        self.ae_utils = LanguageDecoderUtils(
             window_size = config.window_size,
         )
         # self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -1375,9 +1420,9 @@ class LanguageDecoder(GPT2ModelBase):
             A PreprocessOutput containing the pre-processed input ids and embeddings.
         """
         if input_ids is not None:
-            input_ids = self.ae_base.agg_sequence(sequence=input_ids)
+            input_ids = self.ae_utils.agg_sequence(sequence=input_ids)
         if inputs_embeds is not None:
-            inputs_embeds = self.ae_base.agg_sequence(sequence=inputs_embeds)
+            inputs_embeds = self.ae_utils.agg_sequence(sequence=inputs_embeds)
         return PreprocessOutput(input_ids=input_ids, inputs_embeds=inputs_embeds)
     
     def __post_process_outputs(
@@ -1397,10 +1442,10 @@ class LanguageDecoder(GPT2ModelBase):
             return outputs
         # The input last_hidden_state have already the last hidden_states of the last layer, no need to slice
         return BaseAutoencoderOutputWithPastAndCrossAttentions(
-            last_tail_hidden_state=self.ae_base.split_sequence(sequence=outputs.last_hidden_state),
-            last_hidden_state=self.ae_base.split_sequence(sequence=outputs.last_hidden_state),
+            last_tail_hidden_state=self.ae_utils.split_sequence(sequence=outputs.last_hidden_state),
+            last_hidden_state=self.ae_utils.split_sequence(sequence=outputs.last_hidden_state),
             past_key_values=outputs.past_key_values,
-            hidden_states=tuple(self.ae_base.split_sequence(sequence=hidden_state) for hidden_state in outputs.hidden_states) if outputs.hidden_states is not None else None,
+            hidden_states=tuple(self.ae_utils.split_sequence(sequence=hidden_state) for hidden_state in outputs.hidden_states) if outputs.hidden_states is not None else None,
             # TODO: Handle attentions and cross_attentions reshaping
             attentions=outputs.attentions,
             cross_attentions=outputs.cross_attentions,
@@ -1584,7 +1629,7 @@ class LanguageDecoderLMHead(GPT2PreTrainedModel, GenerationMixin):
         multi_head_logits: List[torch.Tensor] = []
         for i in range(self.config.window_size):
             multi_head_logits.append(self.multi_lm_head[i](latents))
-        return self.transformer.ae_base.flatten_multi_heads_logits(logits=multi_head_logits)
+        return self.transformer.ae_utils.flatten_multi_heads_logits(logits=multi_head_logits)
         
     @auto_docstring
     def forward(
