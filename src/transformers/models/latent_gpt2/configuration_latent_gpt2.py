@@ -26,8 +26,8 @@ logger = logging.get_logger(__name__)
 
 class LatentGPT2Config(GPT2Config):
     """
-    This is the configuration class to store the configuration of a [`GPT2Model`]. It is used to
-    instantiate a GPT-2 model according to the specified arguments, defining the model architecture. Instantiating a
+    This is the configuration class to store the configuration of a [`LatnetAutoregressive`]. It is used to
+    instantiate a Latent GPT-2 model according to the specified arguments, defining the model architecture. Instantiating a
     configuration with the defaults will yield a similar configuration to that of the GPT-2
     [openai-community/gpt2](https://huggingface.co/openai-community/gpt2) architecture.
 
