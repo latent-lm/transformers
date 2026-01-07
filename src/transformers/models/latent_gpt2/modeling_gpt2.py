@@ -15,11 +15,10 @@
 # limitations under the License.
 """PyTorch OpenAI GPT-2 model."""
 
-import copy
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import Optional, Union
 
 import torch
 from torch import nn
@@ -34,12 +33,10 @@ from ...modeling_attn_mask_utils import _prepare_4d_attention_mask_for_sdpa
 from ...modeling_layers import GradientCheckpointingLayer
 from ...modeling_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
-    BaseAutoencoderOutputWithPastAndCrossAttentions,
     CausalLMOutputWithCrossAttentions,
     QuestionAnsweringModelOutput,
     SequenceClassifierOutputWithPast,
     TokenClassifierOutput,
-    CausalLMAutoencoderOutputWithCrossAttentions,
 )
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from ...pytorch_utils import Conv1D
@@ -846,461 +843,26 @@ class GPT2LMHeadModel(GPT2PreTrainedModel, GenerationMixin):
         )
 
 @auto_docstring(
-    custom_intro="Base encoder model for language encoding with configurable number of layers.",
+    custom_intro="""
+        The GPT2 Model transformer with a language modeling and a multiple-choice classification head on top e.g. for
+    RocStories/SWAG tasks. The two heads are two linear layers. The language modeling head has its weights tied to the
+    input embeddings, the classification head takes as input the input of a specified classification token index in the
+    input sequence).
+    """
 )
-class LanguageEncoderBase(GPT2ModelBase):
-    def __init__(self, config: LatentGPT2Config):
-        super().__init__(config)
-
-        self.embed_dim = config.hidden_size
-
-        self.wte = nn.Embedding(config.vocab_size, self.embed_dim)
-        self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
-
-        self.drop = nn.Dropout(config.embd_pdrop)
-        self.h = nn.ModuleList([GPT2Block(config, layer_idx=i) for i in range(config.num_hidden_layers_encoder)])
-        self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
-
-        self.gradient_checkpointing = False
-        self._attn_implementation = config._attn_implementation
-
-        # Initialize weights and apply final processing
-        self.post_init()
-
-
-@auto_docstring(
-    custom_intro="Base decoder model for language decoding with configurable number of layers.",
-)
-class LanguageDecoderBase(GPT2ModelBase):
-    def __init__(self, config: LatentGPT2Config):
-        super().__init__(config)
-
-        self.embed_dim = config.hidden_size
-
-        self.wte = nn.Embedding(config.vocab_size, self.embed_dim)
-        self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
-
-        self.drop = nn.Dropout(config.embd_pdrop)
-        self.h = nn.ModuleList([GPT2Block(config, layer_idx=i) for i in range(config.num_hidden_layers_decoder)])
-        self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
-
-        self.gradient_checkpointing = False
-        self._attn_implementation = config._attn_implementation
-
-        # Initialize weights and apply final processing
-        self.post_init()
-
-@auto_docstring(custom_intro="Base class for language encoding with fixed-size window aggregation.")
-class LanguageEncoderUtils:
-    def __init__(
-        self,
-        window_size: int,
-        padding_token: Optional[int] = None,
-        padding_embed: Optional[torch.Tensor] = None,
-        wte: Optional[torch.nn.Embedding] = None,
-    ):
-        self.__batch_size: int = None
-        self.__seq_len: int = None
-        self.__segment_num: int = None
-        
-        self.__window_size: int = window_size  
-        self.__padding_token = padding_token
-        self.__padding_embed = padding_embed
-        self.__wte: torch.nn.Embedding = wte
-        
-    @property
-    def batch_size(self):
-        return self.__batch_size
-
-    @property
-    def seq_len(self):
-        return self.__seq_len
-    
-    @property
-    def segment_num(self):
-        return self.__segment_num
-    
-    @property
-    def window_size(self):
-        return self.__window_size
-    
-    def __get_padding_embed(self) -> torch.FloatTensor:
-        if self.__padding_embed is None:
-            if self.__wte is None:
-                raise ValueError("To get padding_embed, either provide padding_embed or wte")
-            self.__padding_embed = self.__wte(self.__padding_token)
-        return self.__padding_embed
-    def __get_padding_token(self) -> torch.LongTensor:
-        if self.__padding_token is None:
-            raise ValueError("padding_token is not set")
-        return self.__padding_token
-    def __pad(
-        self,
-        sequence: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        """
-        Pad the given sequence to be a multiple of window_size.
-        
-        If sequence is None, return None.
-        
-        For 2D sequence (batch_size, seq_len), pad with padding_token.
-        For 3D sequence (batch_size, seq_len, embedding_size), pad with padding_embed.
-        
-        Raises:
-            NotImplementedError: If the input dimension is not supported.
-        
-        Returns:
-            torch.Tensor: Padded sequence. Shape is (batch_size, seq_len + pad) if sequence is 2D, otherwise (batch_size, seq_len + pad, embedding_size).
-        """
-        if sequence is None:
-            return sequence
-        batch_size: int = sequence.shape[0]
-        seq_len: int = sequence.shape[1]
-        if sequence.dim() == 2:
-            # input_ids shape: batch_size x seq_len
-            pad_len: int = (self.__window_size - (seq_len % self.__window_size)) % self.__window_size
-            pad = torch.ones((batch_size, pad_len), dtype=sequence.dtype, device=sequence.device) * self.__get_padding_token()
-            padded_sequence = torch.cat((sequence, pad), 1)  # input_ids shape: batch_size x seq_len + pad
-        elif sequence.dim() == 3:
-            # inputs_embeds shape: batch_size x seq_len x embedding size
-            pad_len: int = (self.__window_size - (seq_len % self.__window_size)) % self.__window_size
-            pad = torch.ones((batch_size, pad_len, sequence.shape[2]), dtype=sequence.dtype, device=sequence.device) * self.__get_padding_embed()
-            padded_sequence = torch.cat((sequence, pad), 1)  # input_ids shape: batch_size x seq_len + pad
-        else:
-            raise NotImplementedError(f"Unsupported input dimension: {sequence.dim()} with shape {sequence.shape}")
-        return padded_sequence
-    def agg_sequence(
-        self,
-        sequence: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Aggregate a sequence into fixed-size windows.
-
-        Args:
-            sequence (Optional[torch.Tensor]): The sequence to aggregate. For 2D sequence (batch_size, seq_len), pad with padding_token.
-                For 3D sequence (batch_size, seq_len, embedding_size), pad with padding_embed.
-
-        Returns:
-            torch.Tensor: The aggregated sequence. For 2D sequence (batch_size, seq_len), it would return (batch_size * self.__segment_num, self.__window_size).
-                For 3D sequence (batch_size * self.__segment_num, self.__window_size, embedding_size), where self.__segment_num = (seq_len + pad) // self.__window_size
-        """
-        if sequence is None:
-            return sequence
-        self.__batch_size: int = sequence.shape[0]
-        self.__seq_len: int = sequence.shape[1]
-        padded_sequence = self.__pad(sequence=sequence)
-        self.__segment_num: int = padded_sequence.shape[1] // self.__window_size
-        return padded_sequence.view(self.__batch_size * self.__segment_num, self.__window_size, *padded_sequence.shape[2:])
-    def split_sequence(
-        self,
-        sequence: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Split a sequence into fixed-size windows.
-
-        Args:
-            sequence (Optional[torch.Tensor]): The sequence to split, with size (batch_size * self.__segment_num, self.__window_size or 1, embedding_size)
-
-        Returns:
-            torch.Tensor: The split sequence into shape (batch_size, self.__segment_num * (self.__window_size or 1), embedding_size)
-        """
-        if sequence is None:
-            return sequence
-        return sequence.view(self.__batch_size, self.__segment_num * sequence.shape[1], *sequence.shape[2:])
-    
-@auto_docstring(custom_intro="Base class for language decoding with fixed-size window disaggregation.")
-class LanguageDecoderUtils:
-    def __init__(
-        self,
-        window_size: int,
-    ):
-        self.__batch_size: int = None
-        self.__seq_len: int = None
-        self.__segment_num: int = None
-        
-        self.__window_size: int = window_size  
-        
-    @property
-    def batch_size(self):
-        return self.__batch_size
-
-    @property
-    def seq_len(self):
-        return self.__seq_len
-    
-    @property
-    def segment_num(self):
-        return self.__segment_num
-    
-    @property
-    def window_size(self):
-        return self.__window_size
-    
-    def agg_sequence(
-        self,
-        sequence: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Aggregate a sequence into single element.
-
-        Args:
-            sequence (Optional[torch.Tensor]): The sequence to aggregate. For 2D sequence (batch_size, seq_len), pad with padding_token.
-                For 3D sequence (batch_size, seq_len, embedding_size), pad with padding_embed.
-
-        Returns:
-            torch.Tensor: The aggregated sequence. For 2D sequence (batch_size, seq_len), it would return (batch_size * self.__segment_num, 1).
-                For 3D sequence (batch_size * self.__segment_num, 1, embedding_size), where self.__segment_num = seq_len
-        """
-        if sequence is None:
-            return sequence
-        self.__batch_size: int = sequence.shape[0]
-        self.__seq_len: int = sequence.shape[1]
-        self.__segment_num: int = sequence.shape[1]
-        return sequence.view(self.__batch_size * self.__segment_num, 1, *sequence.shape[2:])
-    def split_sequence(
-        self,
-        sequence: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Split a sequence back to original.
-
-        Args:
-            sequence (Optional[torch.Tensor]): The sequence to split, with size (batch_size * self.__segment_num, 1, embedding_size), where self.__segment_num = seq_len
-
-        Returns:
-            torch.Tensor: The split sequence into shape (batch_size, self.__segment_num, embedding_size), where self.__segment_num = seq_len
-        """
-        if sequence is None:
-            return sequence
-        return sequence.view(self.__batch_size, self.__segment_num, *sequence.shape[2:])
-    def flatten_multi_heads_logits(self, logits: torch.Tensor) -> torch.Tensor:
-        """
-        Project decoder hidden states to logits using multi-head mechanism.
-        
-        Args:
-            logits: list of tensors of shape (batch_size, self.__segment_num, vocab_size) with length self.__window_size
-        
-        Returns:
-            flattened_logits: Shape (batch_size, self.__segment_num * self.__window_size, vocab_size)
-        """
-        flatten_seq_shape = (self.__batch_size, self.__segment_num * self.__window_size, *logits[0].shape[2:])
-        # Stack to create tensor with shape: (batch_size, self.__segment_num,  self.__window_size, vocab_size)
-        return torch.stack(logits, dim=2).view(flatten_seq_shape)
-
-@dataclass
-class PreprocessOutput:
-    input_ids: torch.LongTensor
-    inputs_embeds: torch.FloatTensor
-
-@auto_docstring(
-    custom_intro="Language encoder model based on GPT-2 for encoding text into latent representations.",
-    custom_args="window_size (`int`): The window size for aggregating input sequences into segments.",
-)
-class LanguageEncoder(LanguageEncoderBase):
-    def __init__(self, config: LatentGPT2Config):
-        super().__init__(config)
-        self.ae_utils = LanguageEncoderUtils(
-            window_size = config.window_size,
-            padding_token = config.pad_token_id,
-            # padding_token = self.config.eos_token_id,
-            padding_embed = None,
-            wte=self.wte,
-        )
-        # Initialize weights and apply final processing
-        self.post_init()
-    def __pre_process_inputs(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-    ) -> PreprocessOutput:
-        """
-        Pre-processes and segments the inputs for the language encoder.
-
-        Args:
-            input_ids (Optional[torch.LongTensor]): The input ids.
-            inputs_embeds (Optional[torch.FloatTensor]): The input embeddings.
-
-        Returns:
-            A tuple containing the pre-processed input ids and embeddings.
-        """
-        if input_ids is not None:
-            input_ids = self.ae_utils.agg_sequence(sequence=input_ids)
-        if inputs_embeds is not None:
-            inputs_embeds = self.ae_utils.agg_sequence(sequence=inputs_embeds)
-        return PreprocessOutput(input_ids=input_ids, inputs_embeds=inputs_embeds)
-    def __post_process_outputs(
-        self,
-        outputs: BaseModelOutputWithPastAndCrossAttentions,
-    ) -> BaseAutoencoderOutputWithPastAndCrossAttentions:
-        """
-        Post-processes and segment the outputs of the language encoder.
-
-        Args:
-            outputs: The output of the language encoder.
-
-        Returns:
-            The processed output of the language encoder.
-        """
-        if outputs is None:
-            return outputs
-        # Only keep the last hidden_state of hidden_state of the last layer
-        logits_to_keep: int = 1
-        slice_indices = slice(-logits_to_keep, None, None)
-        return BaseAutoencoderOutputWithPastAndCrossAttentions(
-            last_tail_hidden_state=self.ae_utils.split_sequence(sequence=outputs.last_hidden_state[:, slice_indices, :]),
-            last_hidden_state=self.ae_utils.split_sequence(sequence=outputs.last_hidden_state),
-            past_key_values=outputs.past_key_values,
-            hidden_states=tuple(self.ae_utils.split_sequence(sequence=hidden_state) for hidden_state in outputs.hidden_states) if outputs.hidden_states is not None else None,
-            # TODO: Handle attentions and cross_attentions reshaping
-            attentions=outputs.attentions,
-            cross_attentions=outputs.cross_attentions,
-        )
-
-    def init_weight_from_pretrained(self, pretrained_model: GPT2ModelBase):
-        """
-        Initializes the language encoder from a pre-trained model.
-
-        Args:
-            pretrained_model: The pre-trained model to use.
-
-        Returns:
-            A new instance of the class.
-        """
-        self.wte = copy.deepcopy(pretrained_model.wte)
-        self.wpe = copy.deepcopy(pretrained_model.wpe)
-        self.drop = copy.deepcopy(pretrained_model.drop)
-        self.h = copy.deepcopy(pretrained_model.h[:self.config.num_hidden_layers_encoder])
-        self.ln_f = copy.deepcopy(pretrained_model.ln_f)
-        self.gradient_checkpointing = pretrained_model.gradient_checkpointing
-        return self
-    
-    # @classmethod
-    # def build_from_pretrained(
-    #     cls,
-    #     pretrained_model: GPT2ModelBase,
-    #     window_size: int,
-    #     num_hidden_layers: int,
-    # ):
-    #     """
-    #     Builds a new instance of the LanguageEncoder from a pre-trained model.
-
-    #     Args:
-    #         cls: The class to instantiate.
-    #         pretrained: The pre-trained model to use.
-    #         window_size: The window size for the language encoder.
-
-    #     Returns:
-    #         A new instance of the class.
-    #     """
-    #     config: LatentGPT2Config = copy.deepcopy(pretrained_model.config)
-    #     config.num_hidden_layers = num_hidden_layers
-    #     encoder: LanguageEncoder = cls(config=config, window_size=window_size)
-
-    #     encoder.wte = copy.deepcopy(pretrained_model.wte)
-    #     encoder.wpe = copy.deepcopy(pretrained_model.wpe)
-    #     encoder.drop = copy.deepcopy(pretrained_model.drop)
-    #     encoder.h = copy.deepcopy(pretrained_model.h[:num_hidden_layers])
-    #     encoder.ln_f = copy.deepcopy(pretrained_model.ln_f)
-    #     encoder.gradient_checkpointing = pretrained_model.gradient_checkpointing
-
-    #     return encoder
-        
-    @auto_docstring(
-        custom_args="return_segment (`bool`, *optional*, defaults to `True`): Whether to return segmented outputs.",
-    )
-    def forward(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        token_type_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        encoder_attention_mask: Optional[torch.FloatTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        return_segment: bool = True,
-        **kwargs,
-    ) -> Union[tuple, BaseAutoencoderOutputWithPastAndCrossAttentions]:
-        pre_process_res: PreprocessOutput = self.__pre_process_inputs(input_ids=input_ids, inputs_embeds=inputs_embeds)
-        output = super().forward(
-            input_ids=pre_process_res.input_ids,
-            past_key_values=past_key_values,
-            cache_position=cache_position,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-            position_ids=position_ids,
-            inputs_embeds=pre_process_res.inputs_embeds,
-            encoder_hidden_states=encoder_hidden_states,
-            encoder_attention_mask=encoder_attention_mask,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=True,
-            **kwargs,
-        )
-        return self.__post_process_outputs(outputs=output)
-        
-class LanguageEncoderLMHead(GPT2PreTrainedModel, GenerationMixin):
+class GPT2DoubleHeadsModel(GPT2PreTrainedModel, GenerationMixin):
     _tied_weights_keys = {"lm_head.weight": "transformer.wte.weight"}
 
-    def __init__(self, config: LatentGPT2Config):
+    def __init__(self, config):
         super().__init__(config)
-        self.transformer = LanguageEncoder(config=config)
+        config.num_labels = 1
+        self.transformer = GPT2ModelBase(config)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.multiple_choice_head = GPT2SequenceSummary(config)
 
         # Initialize weights and apply final processing
         self.post_init()
-        
-    def init_weight_from_pretrained(self, pretrained_model: GPT2LMHeadModel):
-        """
-        Initializes the language encoder from a pre-trained model.
 
-        Args:
-            pretrained_model: The pre-trained model to use.
-
-        Returns:
-            A new instance of the class.
-        """
-        self.transformer.init_weight_from_pretrained(pretrained_model=pretrained_model.transformer)
-        self.lm_head = copy.deepcopy(pretrained_model.lm_head)
-        return self
-        
-    # @classmethod
-    # def build_from_pretrained(
-    #     cls,
-    #     pretrained_model: GPT2LMHeadModel,
-    #     window_size: int,
-    #     num_hidden_layers: int,
-    # ):
-    #     """
-    #     Builds a new instance of the LanguageDecoder from a pre-trained model.
-
-    #     Args:
-    #         cls: The class to instantiate.
-    #         pretrained: The pre-trained model to use.
-    #         window_size: The window size for the language decoder.
-
-    #     Returns:
-    #         A new instance of the class.
-    #     """
-    #     config: LatentGPT2Config = copy.deepcopy(pretrained_model.config)
-    #     config.num_hidden_layers = num_hidden_layers
-    #     encoder: LanguageEncoder = LanguageEncoder.build_from_pretrained(
-    #         pretrained_model=pretrained_model.transformer,
-    #         window_size=window_size,
-    #         num_hidden_layers=num_hidden_layers)
-
-    #     encoder_lm_head = cls(config=config, window_size=window_size)
-    #     encoder_lm_head.transformer = encoder
-    #     encoder_lm_head.lm_head = copy.deepcopy(pretrained_model.lm_head)
-
-    #     return encoder_lm_head
-        
     @auto_docstring
     def forward(
         self,
@@ -1311,16 +873,15 @@ class LanguageEncoderLMHead(GPT2PreTrainedModel, GenerationMixin):
         token_type_ids: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        mc_token_ids: Optional[torch.LongTensor] = None,
         labels: Optional[torch.LongTensor] = None,
+        mc_labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs,
-    ) -> Union[tuple, CausalLMAutoencoderOutputWithCrossAttentions]:
+    ) -> Union[tuple, GPT2DoubleHeadsModelOutput]:
         r"""
         input_ids (`torch.LongTensor` of shape `(batch_size, input_ids_length)`):
             `input_ids_length` = `sequence_length` if `past_key_values` is `None` else
@@ -1334,323 +895,132 @@ class LanguageEncoderLMHead(GPT2PreTrainedModel, GenerationMixin):
             [`PreTrainedTokenizer.__call__`] for details.
 
             [What are input IDs?](../glossary#input-ids)
+        mc_token_ids (`torch.LongTensor` of shape `(batch_size, num_choices)`, *optional*, default to index of the last token of the input):
+            Index of the classification token in each input sequence. Selected in the range `[0, input_ids.size(-1) -
+            1]`.
         labels (`torch.LongTensor` of shape `(batch_size, input_ids_length)`, *optional*):
             Labels for language modeling. Note that the labels **are shifted** inside the model, i.e. you can set
-            `labels = input_ids` Indices are selected in `[-100, 0, ..., config.vocab_size]` All labels set to `-100`
-            are ignored (masked), the loss is only computed for labels in `[0, ..., config.vocab_size]`
-        """
+            `labels = input_ids`. Indices are selected in `[-100, 0, ..., config.vocab_size - 1]`. All labels set to
+            `-100` are ignored (masked), the loss is only computed for labels in `[0, ..., config.vocab_size - 1]`
+        mc_labels (`torch.LongTensor` of shape `(batch_size)`, *optional*):
+            Labels for computing the multiple choice classification loss. Indices should be in `[0, ..., num_choices]`
+            where *num_choices* is the size of the second dimension of the input tensors. (see *input_ids* above)
+
+        Example:
+
+        ```python
+        >>> import torch
+        >>> from transformers import AutoTokenizer, GPT2DoubleHeadsModel
+
+        >>> tokenizer = AutoTokenizer.from_pretrained("openai-community/gpt2")
+        >>> model = GPT2DoubleHeadsModel.from_pretrained("openai-community/gpt2")
+
+        >>> # Add a [CLS] to the vocabulary (we should train it also!)
+        >>> num_added_tokens = tokenizer.add_special_tokens({"cls_token": "[CLS]"})
+        >>> # Update the model embeddings with the new vocabulary size
+        >>> embedding_layer = model.resize_token_embeddings(len(tokenizer))
+
+        >>> choices = ["Hello, my dog is cute [CLS]", "Hello, my cat is cute [CLS]"]
+        >>> encoded_choices = [tokenizer.encode(s) for s in choices]
+        >>> cls_token_location = [tokens.index(tokenizer.cls_token_id) for tokens in encoded_choices]
+
+        >>> input_ids = torch.tensor(encoded_choices).unsqueeze(0)  # Batch size: 1, number of choices: 2
+        >>> mc_token_ids = torch.tensor([cls_token_location])  # Batch size: 1
+
+        >>> outputs = model(input_ids, mc_token_ids=mc_token_ids)
+        >>> lm_logits = outputs.logits
+        >>> mc_logits = outputs.mc_logits
+        ```"""
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         transformer_outputs = self.transformer(
             input_ids,
             past_key_values=past_key_values,
-            attention_mask=attention_mask,
             cache_position=cache_position,
+            attention_mask=attention_mask,
             token_type_ids=token_type_ids,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
-            encoder_hidden_states=encoder_hidden_states,
-            encoder_attention_mask=encoder_attention_mask,
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            return_dict=True,
+            return_dict=return_dict,
         )
-        # Only use the last hidden_state of the last layer as latent
-        latents = transformer_outputs.last_tail_hidden_state
 
-        # Project the latents to logits
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(latents[:, slice_indices, :])
+        hidden_states = transformer_outputs[0]
 
-        loss = None
+        lm_logits = self.lm_head(hidden_states)
+        mc_logits = self.multiple_choice_head(hidden_states, mc_token_ids).squeeze(-1)
+
+        mc_loss = None
+        if mc_labels is not None:
+            loss_fct = CrossEntropyLoss()
+            mc_loss = loss_fct(mc_logits.view(-1, mc_logits.size(-1)), mc_labels.view(-1))
+        lm_loss = None
         if labels is not None:
-            # Flatten the tokens
-            loss = self.loss_function(
-                logits,
-                labels,
-                vocab_size=self.config.vocab_size,
-                **kwargs,
-            )
+            labels = labels.to(lm_logits.device)
+            shift_logits = lm_logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss_fct = CrossEntropyLoss()
+            lm_loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
         if not return_dict:
-            output = (logits,) + transformer_outputs[1:]
-            return ((loss,) + output) if loss is not None else output
+            output = (lm_logits, mc_logits) + transformer_outputs[1:]
+            if mc_loss is not None:
+                output = (mc_loss,) + output
+            return ((lm_loss,) + output) if lm_loss is not None else output
 
-        return CausalLMAutoencoderOutputWithCrossAttentions(
-            last_tail_hidden_state=transformer_outputs.last_tail_hidden_state,
-            last_hidden_state=transformer_outputs.last_hidden_state,
-            loss=loss,
-            logits=logits,
+        return GPT2DoubleHeadsModelOutput(
+            loss=lm_loss,
+            mc_loss=mc_loss,
+            logits=lm_logits,
+            mc_logits=mc_logits,
             past_key_values=transformer_outputs.past_key_values,
             hidden_states=transformer_outputs.hidden_states,
             attentions=transformer_outputs.attentions,
-            cross_attentions=transformer_outputs.cross_attentions,
-            latents=transformer_outputs.last_tail_hidden_state,
         )
-        
+
+
 @auto_docstring(
-    custom_intro="Language decoder model based on GPT-2 for decoding latent representations back to text.",
-    custom_args="window_size (`int`): The window size for disaggregating latent representations back to sequences.",
+    custom_intro="""
+    The GPT2 Model transformer with a sequence classification head on top (linear layer).
+
+    [`GPT2ForSequenceClassification`] uses the last token in order to do the classification, as other causal models
+    (e.g. GPT-1) do.
+
+    Since it does classification on the last token, it requires to know the position of the last token. If a
+    `pad_token_id` is defined in the configuration, it finds the last token that is not a padding token in each row. If
+    no `pad_token_id` is defined, it simply takes the last value in each row of the batch. Since it cannot guess the
+    padding tokens when `inputs_embeds` are passed instead of `input_ids`, it does the same (take the last value in
+    each row of the batch).
+    """
 )
-class LanguageDecoder(LanguageDecoderBase):
-    def __init__(self, config: LatentGPT2Config):
+class GPT2ForSequenceClassification(GPT2PreTrainedModel):
+    def __init__(self, config):
         super().__init__(config)
-        self.ae_utils = LanguageDecoderUtils(
-            window_size = config.window_size,
-        )
-        # self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.num_labels = config.num_labels
+        self.transformer = GPT2ModelBase(config)
+        self.score = nn.Linear(config.n_embd, self.num_labels, bias=False)
 
         # Initialize weights and apply final processing
         self.post_init()
-        
-    def __pre_process_inputs(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-    ) -> PreprocessOutput:
-        """
-        Pre-processes and segments the inputs for the language decoder.
 
-        Args:
-            input_ids (Optional[torch.LongTensor]): The input ids.
-            inputs_embeds (Optional[torch.FloatTensor]): The input embeddings.
-
-        Returns:
-            A PreprocessOutput containing the pre-processed input ids and embeddings.
-        """
-        if input_ids is not None:
-            input_ids = self.ae_utils.agg_sequence(sequence=input_ids)
-        if inputs_embeds is not None:
-            inputs_embeds = self.ae_utils.agg_sequence(sequence=inputs_embeds)
-        return PreprocessOutput(input_ids=input_ids, inputs_embeds=inputs_embeds)
-    
-    def __post_process_outputs(
-        self,
-        outputs: CausalLMAutoencoderOutputWithCrossAttentions,
-    ):
-        """
-        Post-processes and segment the outputs of the language decoder.
-
-        Args:
-            outputs: The output of the language decoder.
-
-        Returns:
-            The processed output of the language decoder.
-        """
-        if outputs is None:
-            return outputs
-        # The input last_hidden_state have already the last hidden_states of the last layer, no need to slice
-        return BaseAutoencoderOutputWithPastAndCrossAttentions(
-            last_tail_hidden_state=self.ae_utils.split_sequence(sequence=outputs.last_hidden_state),
-            last_hidden_state=self.ae_utils.split_sequence(sequence=outputs.last_hidden_state),
-            past_key_values=outputs.past_key_values,
-            hidden_states=tuple(self.ae_utils.split_sequence(sequence=hidden_state) for hidden_state in outputs.hidden_states) if outputs.hidden_states is not None else None,
-            # TODO: Handle attentions and cross_attentions reshaping
-            attentions=outputs.attentions,
-            cross_attentions=outputs.cross_attentions,
-        )
-
-    def init_weight_from_pretrained(self, pretrained_model: GPT2ModelBase):
-        """
-        Initializes the language decoder from a pre-trained model.
-        
-        Args:
-            pretrained_model: The pre-trained model to use.
-        
-        Returns:
-            A new instance of the class.
-        """
-        self.wte = copy.deepcopy(pretrained_model.wte)
-        self.wpe = copy.deepcopy(pretrained_model.wpe)
-        self.drop = copy.deepcopy(pretrained_model.drop)
-        self.h = copy.deepcopy(pretrained_model.h[-self.config.num_hidden_layers_decoder:])
-        self.ln_f = copy.deepcopy(pretrained_model.ln_f)
-        self.gradient_checkpointing = pretrained_model.gradient_checkpointing
-
-        # Re-index blocks to match the new layer positions (0 to num_hidden_layers_decoder-1)
-        for new_idx, block in enumerate(self.h):
-            block.attn.layer_idx = new_idx
-            if hasattr(block, 'crossattention'):
-                block.crossattention.layer_idx = new_idx
-        return self
-        
-    # @classmethod
-    # def build_from_pretrained(
-    #     cls,
-    #     pretrained_model: GPT2ModelBase,
-    #     window_size: int,
-    #     num_hidden_layers: int,
-    # ):
-    #     """
-    #     Builds a new instance of the LanguageDecoder from a pre-trained model.
-
-    #     Args:
-    #         cls: The class to instantiate.
-    #         pretrained: The pre-trained model to use.
-    #         window_size: The window size for the language decoder.
-
-    #     Returns:
-    #         A new instance of the class.
-    #     """
-    #     config: LatentGPT2Config = copy.deepcopy(pretrained_model.config)
-    #     config.num_hidden_layers = num_hidden_layers
-    #     decoder: LanguageDecoder = cls(config=config, window_size=window_size)
-
-    #     decoder.wte = copy.deepcopy(pretrained_model.wte)
-    #     decoder.wpe = copy.deepcopy(pretrained_model.wpe)
-    #     decoder.drop = copy.deepcopy(pretrained_model.drop)
-    #     decoder.h = copy.deepcopy(pretrained_model.h[num_hidden_layers:])
-    #     decoder.ln_f = copy.deepcopy(pretrained_model.ln_f)
-    #     decoder.gradient_checkpointing = pretrained_model.gradient_checkpointing
-
-    #     # Re-index blocks to match the new layer positions (0 to num_hidden_layers-1)
-    #     for new_idx, block in enumerate(decoder.h):
-    #         block.attn.layer_idx = new_idx
-    #         if hasattr(block, 'crossattention'):
-    #             block.crossattention.layer_idx = new_idx
-
-    #     return decoder
-        
-    # @auto_docstring
-    def forward(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        token_type_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        encoder_attention_mask: Optional[torch.FloatTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        return_segment: bool = True,
-        **kwargs,
-    ) -> Union[tuple, CausalLMAutoencoderOutputWithCrossAttentions]:
-        pre_process_res: PreprocessOutput = self.__pre_process_inputs(input_ids=input_ids, inputs_embeds=inputs_embeds)
-        output = super().forward(
-            input_ids=pre_process_res.input_ids,
-            past_key_values=past_key_values,
-            cache_position=cache_position,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-            position_ids=position_ids,
-            inputs_embeds=pre_process_res.inputs_embeds,
-            encoder_hidden_states=encoder_hidden_states,
-            encoder_attention_mask=encoder_attention_mask,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=True,
-            **kwargs,
-        )
-        return self.__post_process_outputs(outputs=output)
-
-class LanguageDecoderLMHead(GPT2PreTrainedModel, GenerationMixin):
-    # _tied_weights_keys = {"lm_head.weight": "transformer.wte.weight"}
-
-    def __init__(self, config: LatentGPT2Config):
-        super().__init__(config)
-        self.transformer = LanguageDecoder(config=config)
-        
-        # Single head projection mechanism
-        # self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        
-        # Multi-head projection mechanism using window_size heads
-        self.multi_lm_head = nn.ModuleList([
-            nn.Linear(config.n_embd, config.vocab_size, bias=False) 
-            for _ in range(config.window_size)
-        ])
-
-        # Initialize weights and apply final processing
-        self.post_init()
-        
-    def init_weight_from_pretrained(self, pretrained_model: GPT2LMHeadModel):
-        """
-        Initializes the language encoder from a pre-trained model.
-
-        Args:
-            pretrained_model: The pre-trained model to use.
-
-        Returns:
-            A new instance of the class.
-        """
-        self.transformer.init_weight_from_pretrained(pretrained_model=pretrained_model.transformer)
-        for i in range(len(self.multi_lm_head)):
-            self.multi_lm_head[i] = copy.deepcopy(pretrained_model.lm_head)
-        return self
-
-    # @classmethod
-    # def build_from_pretrained(
-    #     cls,
-    #     pretrained_model: GPT2LMHeadModel,
-    #     window_size: int,
-    #     num_hidden_layers: int,
-    # ):
-    #     """
-    #     Builds a new instance of the LanguageDecoder from a pre-trained model.
-
-    #     Args:
-    #         cls: The class to instantiate.
-    #         pretrained: The pre-trained model to use.
-    #         window_size: The window size for the language decoder.
-
-    #     Returns:
-    #         A new instance of the class.
-    #     """
-    #     config: LatentGPT2Config = copy.deepcopy(pretrained_model.config)
-    #     config.num_hidden_layers = num_hidden_layers
-    #     decoder: LanguageDecoder = LanguageDecoder.build_from_pretrained(
-    #         pretrained_model=pretrained_model.transformer,
-    #         window_size=window_size,
-    #         num_hidden_layers=num_hidden_layers)
-
-    #     decoder_lm_head = cls(config=config, window_size=window_size)
-    #     decoder_lm_head.transformer = decoder
-    #     for i in range(len(decoder_lm_head.multi_lm_head)):
-    #         decoder_lm_head.multi_lm_head[i] = copy.deepcopy(pretrained_model.lm_head)
-
-    #     return decoder_lm_head
-    
-    def _project_with_multi_heads(self, latents: torch.Tensor) -> torch.Tensor:
-        """
-        Project decoder hidden states to logits using multi-head mechanism.
-        
-        Args:
-            latents: Shape (batch_size, sequence_length, hidden_size)
-        
-        Returns:
-            logits: Shape (batch_size, sequence_length * config.window_size, vocab_size)
-        """
-        multi_head_logits: List[torch.Tensor] = []
-        for i in range(self.config.window_size):
-            multi_head_logits.append(self.multi_lm_head[i](latents))
-        return self.transformer.ae_utils.flatten_multi_heads_logits(logits=multi_head_logits)
-        
     @auto_docstring
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
         token_type_ids: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        encoder_attention_mask: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs,
-    ) -> Union[tuple, CausalLMAutoencoderOutputWithCrossAttentions]:
+    ) -> Union[tuple, SequenceClassifierOutputWithPast]:
         r"""
         input_ids (`torch.LongTensor` of shape `(batch_size, input_ids_length)`):
             `input_ids_length` = `sequence_length` if `past_key_values` is `None` else
@@ -1664,10 +1034,10 @@ class LanguageDecoderLMHead(GPT2PreTrainedModel, GenerationMixin):
             [`PreTrainedTokenizer.__call__`] for details.
 
             [What are input IDs?](../glossary#input-ids)
-        labels (`torch.LongTensor` of shape `(batch_size, input_ids_length)`, *optional*):
-            Labels for language modeling. Note that the labels **are shifted** inside the model, i.e. you can set
-            `labels = input_ids` Indices are selected in `[-100, 0, ..., config.vocab_size]` All labels set to `-100`
-            are ignored (masked), the loss is only computed for labels in `[0, ..., config.vocab_size]`
+        labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
+            Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
+            config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
+            `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -1675,674 +1045,253 @@ class LanguageDecoderLMHead(GPT2PreTrainedModel, GenerationMixin):
             input_ids,
             past_key_values=past_key_values,
             attention_mask=attention_mask,
-            cache_position=cache_position,
             token_type_ids=token_type_ids,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
-            encoder_hidden_states=encoder_hidden_states,
-            encoder_attention_mask=encoder_attention_mask,
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            return_dict=True,
+            return_dict=return_dict,
         )
-        latents = transformer_outputs.last_tail_hidden_state
+        hidden_states = transformer_outputs[0]
+        logits = self.score(hidden_states)
 
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        # logits = self.lm_head(latents[:, slice_indices, :])
-        logits = self._project_with_multi_heads(latents[:, slice_indices, :])
+        if input_ids is not None:
+            batch_size, sequence_length = input_ids.shape[:2]
+        else:
+            batch_size, sequence_length = inputs_embeds.shape[:2]
+
+        if self.config.pad_token_id is None and batch_size != 1:
+            raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
+        if self.config.pad_token_id is None:
+            last_non_pad_token = -1
+        elif input_ids is not None:
+            # To handle both left- and right- padding, we take the rightmost token that is not equal to pad_token_id
+            non_pad_mask = (input_ids != self.config.pad_token_id).to(logits.device, torch.int32)
+            token_indices = torch.arange(input_ids.shape[-1], device=logits.device, dtype=torch.int32)
+            last_non_pad_token = (token_indices * non_pad_mask).argmax(-1)
+        else:
+            last_non_pad_token = -1
+            logger.warning_once(
+                f"{self.__class__.__name__} will not detect padding tokens in `inputs_embeds`. Results may be "
+                "unexpected if using padding tokens in conjunction with `inputs_embeds.`"
+            )
+
+        pooled_logits = logits[torch.arange(batch_size, device=logits.device), last_non_pad_token]
 
         loss = None
         if labels is not None:
-            # Flatten the tokens
-            loss = self.loss_function(
-                logits,
-                labels,
-                vocab_size=self.config.vocab_size,
-                **kwargs,
-            )
+            if self.config.problem_type is None:
+                if self.num_labels == 1:
+                    self.config.problem_type = "regression"
+                elif self.num_labels > 1 and (labels.dtype == torch.long or labels.dtype == torch.int):
+                    self.config.problem_type = "single_label_classification"
+                else:
+                    self.config.problem_type = "multi_label_classification"
 
+            if self.config.problem_type == "regression":
+                loss_fct = MSELoss()
+                if self.num_labels == 1:
+                    loss = loss_fct(pooled_logits.squeeze(), labels.squeeze())
+                else:
+                    loss = loss_fct(pooled_logits, labels)
+            elif self.config.problem_type == "single_label_classification":
+                loss_fct = CrossEntropyLoss()
+                loss = loss_fct(pooled_logits.view(-1, self.num_labels), labels.view(-1))
+            elif self.config.problem_type == "multi_label_classification":
+                loss_fct = BCEWithLogitsLoss()
+                loss = loss_fct(pooled_logits, labels)
         if not return_dict:
-            output = (logits,) + transformer_outputs[1:]
+            output = (pooled_logits,) + transformer_outputs[1:]
             return ((loss,) + output) if loss is not None else output
 
-        return CausalLMAutoencoderOutputWithCrossAttentions(
-            last_tail_hidden_state=transformer_outputs.last_tail_hidden_state,
-            last_hidden_state=transformer_outputs.last_hidden_state,
+        return SequenceClassifierOutputWithPast(
             loss=loss,
-            logits=logits,
+            logits=pooled_logits,
             past_key_values=transformer_outputs.past_key_values,
             hidden_states=transformer_outputs.hidden_states,
             attentions=transformer_outputs.attentions,
-            cross_attentions=transformer_outputs.cross_attentions,
-            latents=transformer_outputs.last_tail_hidden_state,
         )
 
-class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
-    def __init__(self, config: LatentGPT2Config):
+
+@auto_docstring
+class GPT2ForTokenClassification(GPT2PreTrainedModel):
+    def __init__(self, config):
         super().__init__(config)
-        # self.window_size: int = window_size
-        self.encoder: LanguageEncoderLMHead = LanguageEncoderLMHead(config=config)
-        self.decoder: LanguageDecoderLMHead = LanguageDecoderLMHead(config=config)
-        
+        self.num_labels = config.num_labels
+
+        self.transformer = GPT2ModelBase(config)
+        if hasattr(config, "classifier_dropout") and config.classifier_dropout is not None:
+            classifier_dropout = config.classifier_dropout
+        elif hasattr(config, "hidden_dropout") and config.hidden_dropout is not None:
+            classifier_dropout = config.hidden_dropout
+        else:
+            classifier_dropout = 0.1
+        self.dropout = nn.Dropout(classifier_dropout)
+        self.classifier = nn.Linear(config.hidden_size, config.num_labels)
+
         # Initialize weights and apply final processing
         self.post_init()
 
-    def init_weight_from_pretrained(self, pretrained_model: GPT2LMHeadModel):
-        """
-        Initializes the language encoder from a pre-trained model.
-
-        Args:
-            pretrained_model: The pre-trained model to use.
-
-        Returns:
-            A new instance of the class.
-        """
-        self.encoder.init_weight_from_pretrained(pretrained_model=pretrained_model)
-        self.decoder.init_weight_from_pretrained(pretrained_model=pretrained_model)
-        return self
-
-    # @classmethod
-    # def build_from_pretrained(
-    #     cls,
-    #     pretrained_model: GPT2LMHeadModel,
-    #     window_size: int,
-    #     num_hidden_layers_encoder: int,
-    #     num_hidden_layers_decoder: int,
-    # ):
-    #     """
-    #     Builds a new instance of the LanguageDecoder from a pre-trained model.
-
-    #     Args:
-    #         cls: The class to instantiate.
-    #         pretrained: The pre-trained model to use.
-    #         window_size: The window size for the language decoder.
-
-    #     Returns:
-    #         A new instance of the class.
-    #     """
-    #     config: LatentGPT2Config = copy.deepcopy(pretrained_model.config)
-    #     config.num_hidden_layers_encoder = num_hidden_layers_encoder
-    #     config.num_hidden_layers_decoder = num_hidden_layers_decoder
-
-    #     autoencoder: LanguageAutoencoder = LanguageAutoencoder(config=config, window_size=window_size)
-    #     autoencoder.encoder = LanguageEncoderLMHead.build_from_pretrained(
-    #         pretrained_model=pretrained_model,
-    #         window_size=window_size,
-    #         num_hidden_layers=num_hidden_layers_encoder
-    #     )
-    #     autoencoder.decoder = LanguageDecoderLMHead.build_from_pretrained(
-    #         pretrained_model=pretrained_model,
-    #         window_size=window_size,
-    #         num_hidden_layers=num_hidden_layers_decoder
-    #     )
-    #     return autoencoder
-
+    @auto_docstring
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
         token_type_ids: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        encoder_attention_mask: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        logits_to_keep: Union[int, torch.Tensor] = 0,
-        use_latent_ar: bool = False,
         **kwargs,
-    ) -> Union[tuple, CausalLMAutoencoderOutputWithCrossAttentions]:
+    ) -> Union[tuple, TokenClassifierOutput]:
+        r"""
+        input_ids (`torch.LongTensor` of shape `(batch_size, input_ids_length)`):
+            `input_ids_length` = `sequence_length` if `past_key_values` is `None` else
+            `past_key_values.get_seq_length()` (`sequence_length` of input past key value states). Indices of input
+            sequence tokens in the vocabulary.
+
+            If `past_key_values` is used, only `input_ids` that do not have their past calculated should be passed as
+            `input_ids`.
+
+            Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.encode`] and
+            [`PreTrainedTokenizer.__call__`] for details.
+
+            [What are input IDs?](../glossary#input-ids)
+        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
+            config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
+            `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
+        """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        encoder_output = self.encoder(
-            input_ids=input_ids,
-            # past_key_values=past_key_values,
-            # attention_mask=attention_mask,
-            # cache_position=cache_position,
-            # token_type_ids=token_type_ids,
-            # position_ids=position_ids,
-            # inputs_embeds=inputs_embeds,
-            # encoder_hidden_states=encoder_hidden_states,
-            # encoder_attention_mask=encoder_attention_mask,
-            past_key_values=None,
-            attention_mask=None,
-            cache_position=None,
-            token_type_ids=None,
-            position_ids=None,
-            inputs_embeds=None,
-            encoder_hidden_states=None,
-            encoder_attention_mask=None,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=True,
-            return_dict=True,
-        )
-        # hidden_states = encoder_output[0]
-        decoder_output = self.decoder(
-            input_ids=None,
-            # past_key_values=past_key_values,
-            # attention_mask=attention_mask,
-            # cache_position=cache_position,
-            # token_type_ids=token_type_ids,
-            # position_ids=position_ids,
-            past_key_values=None,
-            attention_mask=None,
-            cache_position=None,
-            token_type_ids=None,
-            position_ids=None,
-            inputs_embeds=encoder_output.last_tail_hidden_state,
-            # encoder_hidden_states=encoder_hidden_states,
-            # encoder_attention_mask=encoder_attention_mask,
-            encoder_hidden_states=None,
-            encoder_attention_mask=None,
+        transformer_outputs = self.transformer(
+            input_ids,
+            past_key_values=past_key_values,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            return_dict=True,
+            return_dict=return_dict,
         )
 
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        # logits = self.lm_head(decoder_output.hidden_states[:, slice_indices, :])
-        logits = decoder_output.logits[:, slice_indices, :]
+        hidden_states = transformer_outputs[0]
+        hidden_states = self.dropout(hidden_states)
+        logits = self.classifier(hidden_states)
 
         loss = None
         if labels is not None:
-            # Flatten the tokens
-            loss = self.loss_function(
-                logits,
-                labels,
-                vocab_size=self.config.vocab_size,
-                **kwargs,
-            )
-
-        # When use_latent_ar=True, return tuple of (ar_outputs, ltar_output, encoder_output)
-        # for the trainer to compute AR loss and flow matching loss
-        if use_latent_ar:
-            ar_outputs = CausalLMAutoencoderOutputWithCrossAttentions(
-                last_tail_hidden_state=decoder_output.last_tail_hidden_state,
-                last_hidden_state=decoder_output.last_hidden_state,
-                loss=loss,
-                logits=logits,
-                past_key_values=decoder_output.past_key_values,
-                hidden_states=decoder_output.hidden_states,
-                attentions=decoder_output.attentions,
-                cross_attentions=decoder_output.cross_attentions,
-            )
-            # ltar_output is the latent AR prediction (placeholder: using encoder_output for now)
-            # encoder_output contains the actual encoder latents
-            return (ar_outputs, encoder_output, encoder_output)
+            labels = labels.to(logits.device)
+            loss_fct = CrossEntropyLoss()
+            loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
 
         if not return_dict:
-            output = (logits,) + decoder_output[1:]
+            output = (logits,) + transformer_outputs[2:]
             return ((loss,) + output) if loss is not None else output
 
-        return CausalLMAutoencoderOutputWithCrossAttentions(
-            last_tail_hidden_state=decoder_output.last_tail_hidden_state,
-            last_hidden_state=decoder_output.last_hidden_state,
+        return TokenClassifierOutput(
             loss=loss,
             logits=logits,
-            past_key_values=decoder_output.past_key_values,
-            hidden_states=decoder_output.hidden_states,
-            attentions=decoder_output.attentions,
-            cross_attentions=decoder_output.cross_attentions,
+            hidden_states=transformer_outputs.hidden_states,
+            attentions=transformer_outputs.attentions,
         )
 
-# @auto_docstring(
-#     custom_intro="""
-#         The GPT2 Model transformer with a language modeling and a multiple-choice classification head on top e.g. for
-#     RocStories/SWAG tasks. The two heads are two linear layers. The language modeling head has its weights tied to the
-#     input embeddings, the classification head takes as input the input of a specified classification token index in the
-#     input sequence).
-#     """
-# )
-# class GPT2DoubleHeadsModel(GPT2PreTrainedModel, GenerationMixin):
-#     _tied_weights_keys = {"lm_head.weight": "transformer.wte.weight"}
 
-#     def __init__(self, config):
-#         super().__init__(config)
-#         config.num_labels = 1
-#         self.transformer = GPT2ModelBase(config)
-#         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-#         self.multiple_choice_head = GPT2SequenceSummary(config)
+@auto_docstring
+class GPT2ForQuestionAnswering(GPT2PreTrainedModel):
+    def __init__(self, config):
+        super().__init__(config)
+        self.num_labels = config.num_labels
+        self.transformer = GPT2ModelBase(config)
+        self.qa_outputs = nn.Linear(config.hidden_size, 2)
 
-#         # Initialize weights and apply final processing
-#         self.post_init()
+        # Initialize weights and apply final processing
+        self.post_init()
 
-#     @auto_docstring
-#     def forward(
-#         self,
-#         input_ids: Optional[torch.LongTensor] = None,
-#         past_key_values: Optional[Cache] = None,
-#         cache_position: Optional[torch.LongTensor] = None,
-#         attention_mask: Optional[torch.FloatTensor] = None,
-#         token_type_ids: Optional[torch.LongTensor] = None,
-#         position_ids: Optional[torch.LongTensor] = None,
-#         inputs_embeds: Optional[torch.FloatTensor] = None,
-#         mc_token_ids: Optional[torch.LongTensor] = None,
-#         labels: Optional[torch.LongTensor] = None,
-#         mc_labels: Optional[torch.LongTensor] = None,
-#         use_cache: Optional[bool] = None,
-#         output_attentions: Optional[bool] = None,
-#         output_hidden_states: Optional[bool] = None,
-#         return_dict: Optional[bool] = None,
-#         **kwargs,
-#     ) -> Union[tuple, GPT2DoubleHeadsModelOutput]:
-#         r"""
-#         input_ids (`torch.LongTensor` of shape `(batch_size, input_ids_length)`):
-#             `input_ids_length` = `sequence_length` if `past_key_values` is `None` else
-#             `past_key_values.get_seq_length()` (`sequence_length` of input past key value states). Indices of input
-#             sequence tokens in the vocabulary.
+    @auto_docstring
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        token_type_ids: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        start_positions: Optional[torch.LongTensor] = None,
+        end_positions: Optional[torch.LongTensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        **kwargs,
+    ) -> Union[tuple, QuestionAnsweringModelOutput]:
+        r"""
+        input_ids (`torch.LongTensor` of shape `(batch_size, input_ids_length)`):
+            `input_ids_length` = `sequence_length` if `past_key_values` is `None` else
+            `past_key_values.get_seq_length()` (`sequence_length` of input past key value states). Indices of input
+            sequence tokens in the vocabulary.
 
-#             If `past_key_values` is used, only `input_ids` that do not have their past calculated should be passed as
-#             `input_ids`.
+            If `past_key_values` is used, only `input_ids` that do not have their past calculated should be passed as
+            `input_ids`.
 
-#             Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.encode`] and
-#             [`PreTrainedTokenizer.__call__`] for details.
+            Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.encode`] and
+            [`PreTrainedTokenizer.__call__`] for details.
 
-#             [What are input IDs?](../glossary#input-ids)
-#         mc_token_ids (`torch.LongTensor` of shape `(batch_size, num_choices)`, *optional*, default to index of the last token of the input):
-#             Index of the classification token in each input sequence. Selected in the range `[0, input_ids.size(-1) -
-#             1]`.
-#         labels (`torch.LongTensor` of shape `(batch_size, input_ids_length)`, *optional*):
-#             Labels for language modeling. Note that the labels **are shifted** inside the model, i.e. you can set
-#             `labels = input_ids`. Indices are selected in `[-100, 0, ..., config.vocab_size - 1]`. All labels set to
-#             `-100` are ignored (masked), the loss is only computed for labels in `[0, ..., config.vocab_size - 1]`
-#         mc_labels (`torch.LongTensor` of shape `(batch_size)`, *optional*):
-#             Labels for computing the multiple choice classification loss. Indices should be in `[0, ..., num_choices]`
-#             where *num_choices* is the size of the second dimension of the input tensors. (see *input_ids* above)
+            [What are input IDs?](../glossary#input-ids)
+        """
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-#         Example:
+        outputs = self.transformer(
+            input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
 
-#         ```python
-#         >>> import torch
-#         >>> from transformers import AutoTokenizer, GPT2DoubleHeadsModel
+        sequence_output = outputs[0]
 
-#         >>> tokenizer = AutoTokenizer.from_pretrained("openai-community/gpt2")
-#         >>> model = GPT2DoubleHeadsModel.from_pretrained("openai-community/gpt2")
+        logits = self.qa_outputs(sequence_output)
+        start_logits, end_logits = logits.split(1, dim=-1)
+        start_logits = start_logits.squeeze(-1).contiguous()
+        end_logits = end_logits.squeeze(-1).contiguous()
 
-#         >>> # Add a [CLS] to the vocabulary (we should train it also!)
-#         >>> num_added_tokens = tokenizer.add_special_tokens({"cls_token": "[CLS]"})
-#         >>> # Update the model embeddings with the new vocabulary size
-#         >>> embedding_layer = model.resize_token_embeddings(len(tokenizer))
+        total_loss = None
+        if start_positions is not None and end_positions is not None:
+            # If we are on multi-GPU, split add a dimension
+            if len(start_positions.size()) > 1:
+                start_positions = start_positions.squeeze(-1).to(start_logits.device)
+            if len(end_positions.size()) > 1:
+                end_positions = end_positions.squeeze(-1).to(end_logits.device)
+            # sometimes the start/end positions are outside our model inputs, we ignore these terms
+            ignored_index = start_logits.size(1)
+            start_positions = start_positions.clamp(0, ignored_index)
+            end_positions = end_positions.clamp(0, ignored_index)
 
-#         >>> choices = ["Hello, my dog is cute [CLS]", "Hello, my cat is cute [CLS]"]
-#         >>> encoded_choices = [tokenizer.encode(s) for s in choices]
-#         >>> cls_token_location = [tokens.index(tokenizer.cls_token_id) for tokens in encoded_choices]
+            loss_fct = CrossEntropyLoss(ignore_index=ignored_index)
+            start_loss = loss_fct(start_logits, start_positions)
+            end_loss = loss_fct(end_logits, end_positions)
+            total_loss = (start_loss + end_loss) / 2
 
-#         >>> input_ids = torch.tensor(encoded_choices).unsqueeze(0)  # Batch size: 1, number of choices: 2
-#         >>> mc_token_ids = torch.tensor([cls_token_location])  # Batch size: 1
+        if not return_dict:
+            output = (start_logits, end_logits) + outputs[2:]
+            return ((total_loss,) + output) if total_loss is not None else output
 
-#         >>> outputs = model(input_ids, mc_token_ids=mc_token_ids)
-#         >>> lm_logits = outputs.logits
-#         >>> mc_logits = outputs.mc_logits
-#         ```"""
-#         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-#         transformer_outputs = self.transformer(
-#             input_ids,
-#             past_key_values=past_key_values,
-#             cache_position=cache_position,
-#             attention_mask=attention_mask,
-#             token_type_ids=token_type_ids,
-#             position_ids=position_ids,
-#             inputs_embeds=inputs_embeds,
-#             use_cache=use_cache,
-#             output_attentions=output_attentions,
-#             output_hidden_states=output_hidden_states,
-#             return_dict=return_dict,
-#         )
-
-#         hidden_states = transformer_outputs[0]
-
-#         lm_logits = self.lm_head(hidden_states)
-#         mc_logits = self.multiple_choice_head(hidden_states, mc_token_ids).squeeze(-1)
-
-#         mc_loss = None
-#         if mc_labels is not None:
-#             loss_fct = CrossEntropyLoss()
-#             mc_loss = loss_fct(mc_logits.view(-1, mc_logits.size(-1)), mc_labels.view(-1))
-#         lm_loss = None
-#         if labels is not None:
-#             labels = labels.to(lm_logits.device)
-#             shift_logits = lm_logits[..., :-1, :].contiguous()
-#             shift_labels = labels[..., 1:].contiguous()
-#             loss_fct = CrossEntropyLoss()
-#             lm_loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-
-#         if not return_dict:
-#             output = (lm_logits, mc_logits) + transformer_outputs[1:]
-#             if mc_loss is not None:
-#                 output = (mc_loss,) + output
-#             return ((lm_loss,) + output) if lm_loss is not None else output
-
-#         return GPT2DoubleHeadsModelOutput(
-#             loss=lm_loss,
-#             mc_loss=mc_loss,
-#             logits=lm_logits,
-#             mc_logits=mc_logits,
-#             past_key_values=transformer_outputs.past_key_values,
-#             hidden_states=transformer_outputs.hidden_states,
-#             attentions=transformer_outputs.attentions,
-#         )
-
-
-# @auto_docstring(
-#     custom_intro="""
-#     The GPT2 Model transformer with a sequence classification head on top (linear layer).
-
-#     [`GPT2ForSequenceClassification`] uses the last token in order to do the classification, as other causal models
-#     (e.g. GPT-1) do.
-
-#     Since it does classification on the last token, it requires to know the position of the last token. If a
-#     `pad_token_id` is defined in the configuration, it finds the last token that is not a padding token in each row. If
-#     no `pad_token_id` is defined, it simply takes the last value in each row of the batch. Since it cannot guess the
-#     padding tokens when `inputs_embeds` are passed instead of `input_ids`, it does the same (take the last value in
-#     each row of the batch).
-#     """
-# )
-# class GPT2ForSequenceClassification(GPT2PreTrainedModel):
-#     def __init__(self, config):
-#         super().__init__(config)
-#         self.num_labels = config.num_labels
-#         self.transformer = GPT2ModelBase(config)
-#         self.score = nn.Linear(config.n_embd, self.num_labels, bias=False)
-
-#         # Initialize weights and apply final processing
-#         self.post_init()
-
-#     @auto_docstring
-#     def forward(
-#         self,
-#         input_ids: Optional[torch.LongTensor] = None,
-#         past_key_values: Optional[Cache] = None,
-#         attention_mask: Optional[torch.FloatTensor] = None,
-#         token_type_ids: Optional[torch.LongTensor] = None,
-#         position_ids: Optional[torch.LongTensor] = None,
-#         inputs_embeds: Optional[torch.FloatTensor] = None,
-#         labels: Optional[torch.LongTensor] = None,
-#         use_cache: Optional[bool] = None,
-#         output_attentions: Optional[bool] = None,
-#         output_hidden_states: Optional[bool] = None,
-#         return_dict: Optional[bool] = None,
-#         **kwargs,
-#     ) -> Union[tuple, SequenceClassifierOutputWithPast]:
-#         r"""
-#         input_ids (`torch.LongTensor` of shape `(batch_size, input_ids_length)`):
-#             `input_ids_length` = `sequence_length` if `past_key_values` is `None` else
-#             `past_key_values.get_seq_length()` (`sequence_length` of input past key value states). Indices of input
-#             sequence tokens in the vocabulary.
-
-#             If `past_key_values` is used, only `input_ids` that do not have their past calculated should be passed as
-#             `input_ids`.
-
-#             Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.encode`] and
-#             [`PreTrainedTokenizer.__call__`] for details.
-
-#             [What are input IDs?](../glossary#input-ids)
-#         labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
-#             Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
-#             config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
-#             `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
-#         """
-#         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-#         transformer_outputs = self.transformer(
-#             input_ids,
-#             past_key_values=past_key_values,
-#             attention_mask=attention_mask,
-#             token_type_ids=token_type_ids,
-#             position_ids=position_ids,
-#             inputs_embeds=inputs_embeds,
-#             use_cache=use_cache,
-#             output_attentions=output_attentions,
-#             output_hidden_states=output_hidden_states,
-#             return_dict=return_dict,
-#         )
-#         hidden_states = transformer_outputs[0]
-#         logits = self.score(hidden_states)
-
-#         if input_ids is not None:
-#             batch_size, sequence_length = input_ids.shape[:2]
-#         else:
-#             batch_size, sequence_length = inputs_embeds.shape[:2]
-
-#         if self.config.pad_token_id is None and batch_size != 1:
-#             raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
-#         if self.config.pad_token_id is None:
-#             last_non_pad_token = -1
-#         elif input_ids is not None:
-#             # To handle both left- and right- padding, we take the rightmost token that is not equal to pad_token_id
-#             non_pad_mask = (input_ids != self.config.pad_token_id).to(logits.device, torch.int32)
-#             token_indices = torch.arange(input_ids.shape[-1], device=logits.device, dtype=torch.int32)
-#             last_non_pad_token = (token_indices * non_pad_mask).argmax(-1)
-#         else:
-#             last_non_pad_token = -1
-#             logger.warning_once(
-#                 f"{self.__class__.__name__} will not detect padding tokens in `inputs_embeds`. Results may be "
-#                 "unexpected if using padding tokens in conjunction with `inputs_embeds.`"
-#             )
-
-#         pooled_logits = logits[torch.arange(batch_size, device=logits.device), last_non_pad_token]
-
-#         loss = None
-#         if labels is not None:
-#             if self.config.problem_type is None:
-#                 if self.num_labels == 1:
-#                     self.config.problem_type = "regression"
-#                 elif self.num_labels > 1 and (labels.dtype == torch.long or labels.dtype == torch.int):
-#                     self.config.problem_type = "single_label_classification"
-#                 else:
-#                     self.config.problem_type = "multi_label_classification"
-
-#             if self.config.problem_type == "regression":
-#                 loss_fct = MSELoss()
-#                 if self.num_labels == 1:
-#                     loss = loss_fct(pooled_logits.squeeze(), labels.squeeze())
-#                 else:
-#                     loss = loss_fct(pooled_logits, labels)
-#             elif self.config.problem_type == "single_label_classification":
-#                 loss_fct = CrossEntropyLoss()
-#                 loss = loss_fct(pooled_logits.view(-1, self.num_labels), labels.view(-1))
-#             elif self.config.problem_type == "multi_label_classification":
-#                 loss_fct = BCEWithLogitsLoss()
-#                 loss = loss_fct(pooled_logits, labels)
-#         if not return_dict:
-#             output = (pooled_logits,) + transformer_outputs[1:]
-#             return ((loss,) + output) if loss is not None else output
-
-#         return SequenceClassifierOutputWithPast(
-#             loss=loss,
-#             logits=pooled_logits,
-#             past_key_values=transformer_outputs.past_key_values,
-#             hidden_states=transformer_outputs.hidden_states,
-#             attentions=transformer_outputs.attentions,
-#         )
-
-
-# @auto_docstring
-# class GPT2ForTokenClassification(GPT2PreTrainedModel):
-#     def __init__(self, config):
-#         super().__init__(config)
-#         self.num_labels = config.num_labels
-
-#         self.transformer = GPT2ModelBase(config)
-#         if hasattr(config, "classifier_dropout") and config.classifier_dropout is not None:
-#             classifier_dropout = config.classifier_dropout
-#         elif hasattr(config, "hidden_dropout") and config.hidden_dropout is not None:
-#             classifier_dropout = config.hidden_dropout
-#         else:
-#             classifier_dropout = 0.1
-#         self.dropout = nn.Dropout(classifier_dropout)
-#         self.classifier = nn.Linear(config.hidden_size, config.num_labels)
-
-#         # Initialize weights and apply final processing
-#         self.post_init()
-
-#     @auto_docstring
-#     def forward(
-#         self,
-#         input_ids: Optional[torch.LongTensor] = None,
-#         past_key_values: Optional[Cache] = None,
-#         attention_mask: Optional[torch.FloatTensor] = None,
-#         token_type_ids: Optional[torch.LongTensor] = None,
-#         position_ids: Optional[torch.LongTensor] = None,
-#         inputs_embeds: Optional[torch.FloatTensor] = None,
-#         labels: Optional[torch.LongTensor] = None,
-#         use_cache: Optional[bool] = None,
-#         output_attentions: Optional[bool] = None,
-#         output_hidden_states: Optional[bool] = None,
-#         return_dict: Optional[bool] = None,
-#         **kwargs,
-#     ) -> Union[tuple, TokenClassifierOutput]:
-#         r"""
-#         input_ids (`torch.LongTensor` of shape `(batch_size, input_ids_length)`):
-#             `input_ids_length` = `sequence_length` if `past_key_values` is `None` else
-#             `past_key_values.get_seq_length()` (`sequence_length` of input past key value states). Indices of input
-#             sequence tokens in the vocabulary.
-
-#             If `past_key_values` is used, only `input_ids` that do not have their past calculated should be passed as
-#             `input_ids`.
-
-#             Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.encode`] and
-#             [`PreTrainedTokenizer.__call__`] for details.
-
-#             [What are input IDs?](../glossary#input-ids)
-#         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-#             Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
-#             config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
-#             `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
-#         """
-#         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-#         transformer_outputs = self.transformer(
-#             input_ids,
-#             past_key_values=past_key_values,
-#             attention_mask=attention_mask,
-#             token_type_ids=token_type_ids,
-#             position_ids=position_ids,
-#             inputs_embeds=inputs_embeds,
-#             use_cache=use_cache,
-#             output_attentions=output_attentions,
-#             output_hidden_states=output_hidden_states,
-#             return_dict=return_dict,
-#         )
-
-#         hidden_states = transformer_outputs[0]
-#         hidden_states = self.dropout(hidden_states)
-#         logits = self.classifier(hidden_states)
-
-#         loss = None
-#         if labels is not None:
-#             labels = labels.to(logits.device)
-#             loss_fct = CrossEntropyLoss()
-#             loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
-
-#         if not return_dict:
-#             output = (logits,) + transformer_outputs[2:]
-#             return ((loss,) + output) if loss is not None else output
-
-#         return TokenClassifierOutput(
-#             loss=loss,
-#             logits=logits,
-#             hidden_states=transformer_outputs.hidden_states,
-#             attentions=transformer_outputs.attentions,
-#         )
-
-
-# @auto_docstring
-# class GPT2ForQuestionAnswering(GPT2PreTrainedModel):
-#     def __init__(self, config):
-#         super().__init__(config)
-#         self.num_labels = config.num_labels
-#         self.transformer = GPT2ModelBase(config)
-#         self.qa_outputs = nn.Linear(config.hidden_size, 2)
-
-#         # Initialize weights and apply final processing
-#         self.post_init()
-
-#     @auto_docstring
-#     def forward(
-#         self,
-#         input_ids: Optional[torch.LongTensor] = None,
-#         attention_mask: Optional[torch.FloatTensor] = None,
-#         token_type_ids: Optional[torch.LongTensor] = None,
-#         position_ids: Optional[torch.LongTensor] = None,
-#         inputs_embeds: Optional[torch.FloatTensor] = None,
-#         start_positions: Optional[torch.LongTensor] = None,
-#         end_positions: Optional[torch.LongTensor] = None,
-#         output_attentions: Optional[bool] = None,
-#         output_hidden_states: Optional[bool] = None,
-#         return_dict: Optional[bool] = None,
-#         **kwargs,
-#     ) -> Union[tuple, QuestionAnsweringModelOutput]:
-#         r"""
-#         input_ids (`torch.LongTensor` of shape `(batch_size, input_ids_length)`):
-#             `input_ids_length` = `sequence_length` if `past_key_values` is `None` else
-#             `past_key_values.get_seq_length()` (`sequence_length` of input past key value states). Indices of input
-#             sequence tokens in the vocabulary.
-
-#             If `past_key_values` is used, only `input_ids` that do not have their past calculated should be passed as
-#             `input_ids`.
-
-#             Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.encode`] and
-#             [`PreTrainedTokenizer.__call__`] for details.
-
-#             [What are input IDs?](../glossary#input-ids)
-#         """
-#         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-#         outputs = self.transformer(
-#             input_ids,
-#             attention_mask=attention_mask,
-#             token_type_ids=token_type_ids,
-#             position_ids=position_ids,
-#             inputs_embeds=inputs_embeds,
-#             output_attentions=output_attentions,
-#             output_hidden_states=output_hidden_states,
-#             return_dict=return_dict,
-#         )
-
-#         sequence_output = outputs[0]
-
-#         logits = self.qa_outputs(sequence_output)
-#         start_logits, end_logits = logits.split(1, dim=-1)
-#         start_logits = start_logits.squeeze(-1).contiguous()
-#         end_logits = end_logits.squeeze(-1).contiguous()
-
-#         total_loss = None
-#         if start_positions is not None and end_positions is not None:
-#             # If we are on multi-GPU, split add a dimension
-#             if len(start_positions.size()) > 1:
-#                 start_positions = start_positions.squeeze(-1).to(start_logits.device)
-#             if len(end_positions.size()) > 1:
-#                 end_positions = end_positions.squeeze(-1).to(end_logits.device)
-#             # sometimes the start/end positions are outside our model inputs, we ignore these terms
-#             ignored_index = start_logits.size(1)
-#             start_positions = start_positions.clamp(0, ignored_index)
-#             end_positions = end_positions.clamp(0, ignored_index)
-
-#             loss_fct = CrossEntropyLoss(ignore_index=ignored_index)
-#             start_loss = loss_fct(start_logits, start_positions)
-#             end_loss = loss_fct(end_logits, end_positions)
-#             total_loss = (start_loss + end_loss) / 2
-
-#         if not return_dict:
-#             output = (start_logits, end_logits) + outputs[2:]
-#             return ((total_loss,) + output) if total_loss is not None else output
-
-#         return QuestionAnsweringModelOutput(
-#             loss=total_loss,
-#             start_logits=start_logits,
-#             end_logits=end_logits,
-#             hidden_states=outputs.hidden_states,
-#             attentions=outputs.attentions,
-#         )
+        return QuestionAnsweringModelOutput(
+            loss=total_loss,
+            start_logits=start_logits,
+            end_logits=end_logits,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
 
 
 __all__ = [
@@ -2352,7 +1301,7 @@ __all__ = [
     # "GPT2ForTokenClassification",
     "GPT2ModelBase",
     # "GPT2PreTrainedModel",
-    "LanguageAutoencoder",
-    "LanguageDecoderLMHead",
-    "LanguageEncoderLMHead",
+    # "LanguageAutoencoder",
+    # "LanguageDecoderLMHead",
+    # "LanguageEncoderLMHead",
 ]

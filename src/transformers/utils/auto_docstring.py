@@ -68,6 +68,7 @@ HARDCODED_CONFIG_FOR_MODELS = {
     "esmfold": "EsmConfig",
     "parakeet": "ParakeetCTCConfig",
     "lasr": "LasrCTCConfig",
+    "autoencoder": "LatentGPT2Config",
 }
 
 _re_checkpoint = re.compile(r"\[(.+?)\]\((https://huggingface\.co/.+?)\)")
