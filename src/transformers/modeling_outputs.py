@@ -776,7 +776,15 @@ class CausalLMOutputWithCrossAttentions(ModelOutput):
     hidden_states: Optional[tuple[torch.FloatTensor, ...]] = None
     attentions: Optional[tuple[torch.FloatTensor, ...]] = None
     cross_attentions: Optional[tuple[torch.FloatTensor, ...]] = None
+
+@dataclass
+class PreprocessOutput:
+    """
     
+    """
+    input_ids: torch.LongTensor
+    inputs_embeds: torch.FloatTensor
+
 @dataclass
 class CausalLMAutoencoderOutputWithCrossAttentions(ModelOutput):
     """
@@ -829,6 +837,112 @@ class CausalLMAutoencoderOutputWithCrossAttentions(ModelOutput):
     attentions: Optional[tuple[torch.FloatTensor, ...]] = None
     cross_attentions: Optional[tuple[torch.FloatTensor, ...]] = None
     latents: Optional[torch.FloatTensor] = None
+    
+@dataclass
+class CausalLatentLMOutputWithCrossAttentions(ModelOutput):
+    """
+    Base class for causal language model (or autoregressive) autoencoder outputs.
+
+    Args:
+        last_hidden_states (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)` for encoder ouput and `(batch_size, 1, config.hidden_size)` for decoder output):
+            Sequence of hidden-states at the output of the last layer of the model.
+
+            If `past_key_values` is used only the last hidden-state of the sequences of shape `(batch_size, 1,
+            hidden_size)` is output.
+        loss (`torch.FloatTensor` of shape `(1,)`, *optional*, returned when `labels` is provided):
+            language autoencoder loss.
+        logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.vocab_size)`):
+            Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
+        hidden_states (`tuple(torch.FloatTensor)`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
+            Tuple of `torch.FloatTensor` (one for the output of the embeddings, if the model has an embedding layer, +
+            one for the output of each layer) of shape `(batch_size, sequence_length, hidden_size)` for encoder and `(batch_size, 1, hidden_size)` for decoder.
+
+            Hidden-states of the model at the output of each layer plus the optional initial embedding outputs.
+        attentions (`tuple(torch.FloatTensor)`, *optional*, returned when `output_attentions=True` is passed or when `config.output_attentions=True`):
+            Tuple of `torch.FloatTensor` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+            sequence_length)`.
+
+            Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
+            heads.
+        cross_attentions (`tuple(torch.FloatTensor)`, *optional*, returned when `output_attentions=True` is passed or when `config.output_attentions=True`):
+            Tuple of `torch.FloatTensor` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+            sequence_length)`.
+
+            Cross attentions weights after the attention softmax, used to compute the weighted average in the
+            cross-attention heads.
+        past_key_values (`Cache`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
+            It is a [`~cache_utils.Cache`] instance. For more details, see our [kv cache guide](https://huggingface.co/docs/transformers/en/kv_cache).
+
+            Contains pre-computed hidden-states (key and values in the attention blocks) that can be used (see
+            `past_key_values` input) to speed up sequential decoding.
+        input_latents (`torch.FloatTensor` of shape `(batch_size, segment_num, config.hidden_size)`):
+            The latent of the input context sequence.
+        output_latents (`torch.FloatTensor` of shape `(batch_size, 1, config.hidden_size)`):
+            The latent of the output segment.
+    """
+
+    last_hidden_state: Optional[torch.FloatTensor] = None
+    loss: Optional[torch.FloatTensor] = None
+    logits: Optional[torch.FloatTensor] = None
+    past_key_values: Optional[Cache] = None
+    hidden_states: Optional[tuple[torch.FloatTensor, ...]] = None
+    attentions: Optional[tuple[torch.FloatTensor, ...]] = None
+    cross_attentions: Optional[tuple[torch.FloatTensor, ...]] = None
+    input_latents: Optional[torch.FloatTensor] = None
+    output_latents: Optional[torch.FloatTensor] = None
+    
+@dataclass
+class CausalLMFlowMatchingOutputWithCrossAttentions(ModelOutput):
+    """
+    Base class for causal language model (or autoregressive) autoencoder outputs.
+
+    Args:
+        last_hidden_states (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)` for encoder ouput and `(batch_size, 1, config.hidden_size)` for decoder output):
+            Sequence of hidden-states at the output of the last layer of the model.
+
+            If `past_key_values` is used only the last hidden-state of the sequences of shape `(batch_size, 1,
+            hidden_size)` is output.
+        loss (`torch.FloatTensor` of shape `(1,)`, *optional*, returned when `labels` is provided):
+            language autoencoder loss.
+        logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`):
+            Prediction of the flow maching model output, which is the tail of the last hidden state of the transformer.
+        hidden_states (`tuple(torch.FloatTensor)`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
+            Tuple of `torch.FloatTensor` (one for the output of the embeddings, if the model has an embedding layer, +
+            one for the output of each layer) of shape `(batch_size, sequence_length, hidden_size)` for encoder and `(batch_size, 1, hidden_size)` for decoder.
+
+            Hidden-states of the model at the output of each layer plus the optional initial embedding outputs.
+        attentions (`tuple(torch.FloatTensor)`, *optional*, returned when `output_attentions=True` is passed or when `config.output_attentions=True`):
+            Tuple of `torch.FloatTensor` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+            sequence_length)`.
+
+            Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
+            heads.
+        cross_attentions (`tuple(torch.FloatTensor)`, *optional*, returned when `output_attentions=True` is passed or when `config.output_attentions=True`):
+            Tuple of `torch.FloatTensor` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+            sequence_length)`.
+
+            Cross attentions weights after the attention softmax, used to compute the weighted average in the
+            cross-attention heads.
+        past_key_values (`Cache`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
+            It is a [`~cache_utils.Cache`] instance. For more details, see our [kv cache guide](https://huggingface.co/docs/transformers/en/kv_cache).
+
+            Contains pre-computed hidden-states (key and values in the attention blocks) that can be used (see
+            `past_key_values` input) to speed up sequential decoding.
+        last_latents (`torch.FloatTensor` of shape `(batch_size, 1, config.hidden_size)`):
+            The last latent of flow matching model output.
+        latents (`torch.FloatTensor` of shape `(batch_size, sampling_steps, 1, config.hidden_size)`):
+            The latent history of flow matching model output.
+    """
+
+    last_hidden_state: Optional[torch.FloatTensor] = None
+    loss: Optional[torch.FloatTensor] = None
+    logits: Optional[torch.FloatTensor] = None
+    past_key_values: Optional[Cache] = None
+    hidden_states: Optional[tuple[torch.FloatTensor, ...]] = None
+    attentions: Optional[tuple[torch.FloatTensor, ...]] = None
+    cross_attentions: Optional[tuple[torch.FloatTensor, ...]] = None
+    last_latents: Optional[torch.FloatTensor] = None
+    latents: Optional[tuple[torch.FloatTensor, ...]] = None
     
 @dataclass
 class LatentCausalLMOutputWithCrossAttentions(ModelOutput):

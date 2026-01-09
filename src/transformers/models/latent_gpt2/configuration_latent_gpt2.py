@@ -108,6 +108,8 @@ class LatentGPT2Config(GPT2Config):
             Number of hidden layers in the latent encoder stack.
         num_hidden_layers_decoder (`int`, *optional*, defaults to 6):
             Number of hidden layers in the latent decoder stack.
+        num_hidden_layers_fm (`int`, *optional*, defaults to 10):
+            Number of hidden layers in the flow matching stack.
 
     Example:
 
@@ -153,7 +155,9 @@ class LatentGPT2Config(GPT2Config):
         window_size=4,
         num_hidden_layers_encoder=6,
         num_hidden_layers_decoder=6,
+        num_hidden_layers_fm=10,
         pad_token_id=50256,
+        fm_min_sigma=0.01,
         **kwargs,
     ):
         super().__init__(
@@ -185,7 +189,9 @@ class LatentGPT2Config(GPT2Config):
         self.window_size = window_size
         self.num_hidden_layers_encoder = num_hidden_layers_encoder
         self.num_hidden_layers_decoder = num_hidden_layers_decoder
+        self.num_hidden_layers_fm = num_hidden_layers_fm
         self.pad_token_id = pad_token_id
+        self.fm_min_sigma = fm_min_sigma
         
     @classmethod
     def build_from_pretrained(
@@ -194,7 +200,9 @@ class LatentGPT2Config(GPT2Config):
         window_size: Optional[int] = 4,
         num_hidden_layers_encoder: Optional[int] = 6,
         num_hidden_layers_decoder: Optional[int] = 6,
+        num_hidden_layers_fm: Optional[int] = 10,
         pad_token_id: Optional[int] = 50256,
+        fm_min_sigma: Optional[float] = 0.01,
     ):
         """
         Builds a new instance of the LatentGPT2Config from a pre-trained model.
@@ -203,7 +211,11 @@ class LatentGPT2Config(GPT2Config):
             cls: The class to instantiate.
             config: The configuration of the pre-trained model to use.
             window_size: The window size for the language decoder.
+            num_hidden_layers_encoder: The number of hidden layers in the encoder.
+            num_hidden_layers_decoder: The number of hidden layers in the decoder.
+            num_hidden_layers_fm: The number of hidden layers in the flow matching.
             pad_token_id: The id of the padding token.
+            fm_min_sigma: The minimum sigma value for the flow matching.
 
         Returns:
             A new instance of the class.
@@ -214,7 +226,9 @@ class LatentGPT2Config(GPT2Config):
                 "window_size": window_size,
                 "num_hidden_layers_encoder": num_hidden_layers_encoder,
                 "num_hidden_layers_decoder": num_hidden_layers_decoder,
+                "num_hidden_layers_fm": num_hidden_layers_fm,
                 "pad_token_id": pad_token_id,
+                "fm_min_sigma": fm_min_sigma,
             }
         )
         return cls(**base_kwargs)

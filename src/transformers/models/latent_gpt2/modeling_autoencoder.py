@@ -34,6 +34,7 @@ from ...generation import GenerationMixin
 # from ...modeling_layers import GradientCheckpointingLayer
 from ...modeling_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
+    PreprocessOutput,
     BaseAutoencoderOutputWithPastAndCrossAttentions,
     # CausalLMOutputWithCrossAttentions,
     # QuestionAnsweringModelOutput,
@@ -1088,11 +1089,6 @@ class LanguageDecoderUtils:
         # Stack to create tensor with shape: (batch_size, self.__segment_num,  self.__window_size, vocab_size)
         return torch.stack(logits, dim=2).view(flatten_seq_shape)
 
-@dataclass
-class PreprocessOutput:
-    input_ids: torch.LongTensor
-    inputs_embeds: torch.FloatTensor
-
 @auto_docstring(
     custom_intro="Language encoder model based on GPT-2 for encoding text into latent representations.",
     custom_args="window_size (`int`): The window size for aggregating input sequences into segments.",
@@ -1173,39 +1169,14 @@ class LanguageEncoder(LanguageEncoderBase):
         self.h = copy.deepcopy(pretrained_model.h[:self.config.num_hidden_layers_encoder])
         self.ln_f = copy.deepcopy(pretrained_model.ln_f)
         self.gradient_checkpointing = pretrained_model.gradient_checkpointing
-        return self
-    
-    # @classmethod
-    # def build_from_pretrained(
-    #     cls,
-    #     pretrained_model: GPT2ModelBase,
-    #     window_size: int,
-    #     num_hidden_layers: int,
-    # ):
-    #     """
-    #     Builds a new instance of the LanguageEncoder from a pre-trained model.
-
-    #     Args:
-    #         cls: The class to instantiate.
-    #         pretrained: The pre-trained model to use.
-    #         window_size: The window size for the language encoder.
-
-    #     Returns:
-    #         A new instance of the class.
-    #     """
-    #     config: LatentGPT2Config = copy.deepcopy(pretrained_model.config)
-    #     config.num_hidden_layers = num_hidden_layers
-    #     encoder: LanguageEncoder = cls(config=config, window_size=window_size)
-
-    #     encoder.wte = copy.deepcopy(pretrained_model.wte)
-    #     encoder.wpe = copy.deepcopy(pretrained_model.wpe)
-    #     encoder.drop = copy.deepcopy(pretrained_model.drop)
-    #     encoder.h = copy.deepcopy(pretrained_model.h[:num_hidden_layers])
-    #     encoder.ln_f = copy.deepcopy(pretrained_model.ln_f)
-    #     encoder.gradient_checkpointing = pretrained_model.gradient_checkpointing
-
-    #     return encoder
         
+        # Re-index blocks to match the new layer positions (0 to num_hidden_layers_decoder-1)
+        for new_idx, block in enumerate(self.h):
+            block.attn.layer_idx = new_idx
+            if hasattr(block, 'crossattention'):
+                block.crossattention.layer_idx = new_idx
+        return self
+
     @auto_docstring(
         custom_args="return_segment (`bool`, *optional*, defaults to `True`): Whether to return segmented outputs.",
     )
@@ -1270,37 +1241,6 @@ class LanguageEncoderLMHead(GPT2PreTrainedModel, GenerationMixin):
         self.transformer.init_weight_from_pretrained(pretrained_model=pretrained_model.transformer)
         self.lm_head = copy.deepcopy(pretrained_model.lm_head)
         return self
-        
-    # @classmethod
-    # def build_from_pretrained(
-    #     cls,
-    #     pretrained_model: GPT2LMHeadModel,
-    #     window_size: int,
-    #     num_hidden_layers: int,
-    # ):
-    #     """
-    #     Builds a new instance of the LanguageDecoder from a pre-trained model.
-
-    #     Args:
-    #         cls: The class to instantiate.
-    #         pretrained: The pre-trained model to use.
-    #         window_size: The window size for the language decoder.
-
-    #     Returns:
-    #         A new instance of the class.
-    #     """
-    #     config: LatentGPT2Config = copy.deepcopy(pretrained_model.config)
-    #     config.num_hidden_layers = num_hidden_layers
-    #     encoder: LanguageEncoder = LanguageEncoder.build_from_pretrained(
-    #         pretrained_model=pretrained_model.transformer,
-    #         window_size=window_size,
-    #         num_hidden_layers=num_hidden_layers)
-
-    #     encoder_lm_head = cls(config=config, window_size=window_size)
-    #     encoder_lm_head.transformer = encoder
-    #     encoder_lm_head.lm_head = copy.deepcopy(pretrained_model.lm_head)
-
-    #     return encoder_lm_head
 
     @auto_docstring(
         custom_intro="Forward pass for the language encoder with LM head.",
@@ -1478,44 +1418,7 @@ class LanguageDecoder(LanguageDecoderBase):
             if hasattr(block, 'crossattention'):
                 block.crossattention.layer_idx = new_idx
         return self
-        
-    # @classmethod
-    # def build_from_pretrained(
-    #     cls,
-    #     pretrained_model: GPT2ModelBase,
-    #     window_size: int,
-    #     num_hidden_layers: int,
-    # ):
-    #     """
-    #     Builds a new instance of the LanguageDecoder from a pre-trained model.
 
-    #     Args:
-    #         cls: The class to instantiate.
-    #         pretrained: The pre-trained model to use.
-    #         window_size: The window size for the language decoder.
-
-    #     Returns:
-    #         A new instance of the class.
-    #     """
-    #     config: LatentGPT2Config = copy.deepcopy(pretrained_model.config)
-    #     config.num_hidden_layers = num_hidden_layers
-    #     decoder: LanguageDecoder = cls(config=config, window_size=window_size)
-
-    #     decoder.wte = copy.deepcopy(pretrained_model.wte)
-    #     decoder.wpe = copy.deepcopy(pretrained_model.wpe)
-    #     decoder.drop = copy.deepcopy(pretrained_model.drop)
-    #     decoder.h = copy.deepcopy(pretrained_model.h[num_hidden_layers:])
-    #     decoder.ln_f = copy.deepcopy(pretrained_model.ln_f)
-    #     decoder.gradient_checkpointing = pretrained_model.gradient_checkpointing
-
-    #     # Re-index blocks to match the new layer positions (0 to num_hidden_layers-1)
-    #     for new_idx, block in enumerate(decoder.h):
-    #         block.attn.layer_idx = new_idx
-    #         if hasattr(block, 'crossattention'):
-    #             block.crossattention.layer_idx = new_idx
-
-    #     return decoder
-        
     # @auto_docstring
     def forward(
         self,
@@ -1588,38 +1491,6 @@ class LanguageDecoderLMHead(GPT2PreTrainedModel, GenerationMixin):
             self.multi_lm_head[i] = copy.deepcopy(pretrained_model.lm_head)
         return self
 
-    # @classmethod
-    # def build_from_pretrained(
-    #     cls,
-    #     pretrained_model: GPT2LMHeadModel,
-    #     window_size: int,
-    #     num_hidden_layers: int,
-    # ):
-    #     """
-    #     Builds a new instance of the LanguageDecoder from a pre-trained model.
-
-    #     Args:
-    #         cls: The class to instantiate.
-    #         pretrained: The pre-trained model to use.
-    #         window_size: The window size for the language decoder.
-
-    #     Returns:
-    #         A new instance of the class.
-    #     """
-    #     config: LatentGPT2Config = copy.deepcopy(pretrained_model.config)
-    #     config.num_hidden_layers = num_hidden_layers
-    #     decoder: LanguageDecoder = LanguageDecoder.build_from_pretrained(
-    #         pretrained_model=pretrained_model.transformer,
-    #         window_size=window_size,
-    #         num_hidden_layers=num_hidden_layers)
-
-    #     decoder_lm_head = cls(config=config, window_size=window_size)
-    #     decoder_lm_head.transformer = decoder
-    #     for i in range(len(decoder_lm_head.multi_lm_head)):
-    #         decoder_lm_head.multi_lm_head[i] = copy.deepcopy(pretrained_model.lm_head)
-
-    #     return decoder_lm_head
-    
     def _project_with_multi_heads(self, latents: torch.Tensor) -> torch.Tensor:
         """
         Project decoder hidden states to logits using multi-head mechanism.
@@ -1748,42 +1619,6 @@ class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
         self.encoder.init_weight_from_pretrained(pretrained_model=pretrained_model)
         self.decoder.init_weight_from_pretrained(pretrained_model=pretrained_model)
         return self
-
-    # @classmethod
-    # def build_from_pretrained(
-    #     cls,
-    #     pretrained_model: GPT2LMHeadModel,
-    #     window_size: int,
-    #     num_hidden_layers_encoder: int,
-    #     num_hidden_layers_decoder: int,
-    # ):
-    #     """
-    #     Builds a new instance of the LanguageDecoder from a pre-trained model.
-
-    #     Args:
-    #         cls: The class to instantiate.
-    #         pretrained: The pre-trained model to use.
-    #         window_size: The window size for the language decoder.
-
-    #     Returns:
-    #         A new instance of the class.
-    #     """
-    #     config: LatentGPT2Config = copy.deepcopy(pretrained_model.config)
-    #     config.num_hidden_layers_encoder = num_hidden_layers_encoder
-    #     config.num_hidden_layers_decoder = num_hidden_layers_decoder
-
-    #     autoencoder: LanguageAutoencoder = LanguageAutoencoder(config=config, window_size=window_size)
-    #     autoencoder.encoder = LanguageEncoderLMHead.build_from_pretrained(
-    #         pretrained_model=pretrained_model,
-    #         window_size=window_size,
-    #         num_hidden_layers=num_hidden_layers_encoder
-    #     )
-    #     autoencoder.decoder = LanguageDecoderLMHead.build_from_pretrained(
-    #         pretrained_model=pretrained_model,
-    #         window_size=window_size,
-    #         num_hidden_layers=num_hidden_layers_decoder
-    #     )
-    #     return autoencoder
 
     def forward(
         self,
