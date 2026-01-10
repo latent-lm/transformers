@@ -13,7 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""OpenAI GPT-2 configuration"""
+"""Latent GPT-2 configuration"""
 
 from typing import Optional
 
@@ -110,6 +110,12 @@ class LatentGPT2Config(GPT2Config):
             Number of hidden layers in the latent decoder stack.
         num_hidden_layers_fm (`int`, *optional*, defaults to 10):
             Number of hidden layers in the flow matching stack.
+        pad_token_id (`int`, *optional*, defaults to 50256):
+            Id of the padding token in the vocabulary.
+        fm_min_sigma (`float`, *optional*, defaults to 0.01):
+            The minimum sigma value for the flow matching noise schedule.
+        fm_num_train_timesteps (`int`, *optional*, defaults to 1000):
+            The number of training timesteps for the flow matching process.
 
     Example:
 
@@ -128,38 +134,39 @@ class LatentGPT2Config(GPT2Config):
 
     def __init__(
         self,
-        vocab_size=50257,
-        n_positions=1024,
-        n_embd=768,
-        n_layer=12,
-        n_head=12,
-        n_inner=None,
-        activation_function="gelu_new",
-        resid_pdrop=0.1,
-        embd_pdrop=0.1,
-        attn_pdrop=0.1,
-        layer_norm_epsilon=1e-5,
-        initializer_range=0.02,
-        summary_type="cls_index",
-        summary_use_proj=True,
-        summary_activation=None,
-        summary_proj_to_labels=True,
-        summary_first_dropout=0.1,
-        scale_attn_weights=True,
-        use_cache=True,
-        bos_token_id=50256,
-        eos_token_id=50256,
-        scale_attn_by_inverse_layer_idx=False,
-        reorder_and_upcast_attn=False,
+        vocab_size: int = 50257,
+        n_positions: int = 1024,
+        n_embd: int = 768,
+        n_layer: int = 12,
+        n_head: int = 12,
+        n_inner: Optional[int] = None,
+        activation_function: str = "gelu_new",
+        resid_pdrop: float = 0.1,
+        embd_pdrop: float = 0.1,
+        attn_pdrop: float = 0.1,
+        layer_norm_epsilon: float = 1e-5,
+        initializer_range: float = 0.02,
+        summary_type: str = "cls_index",
+        summary_use_proj: bool = True,
+        summary_activation: Optional[str] = None,
+        summary_proj_to_labels: bool = True,
+        summary_first_dropout: float = 0.1,
+        scale_attn_weights: bool = True,
+        use_cache: bool = True,
+        bos_token_id: int = 50256,
+        eos_token_id: int = 50256,
+        scale_attn_by_inverse_layer_idx: bool = False,
+        reorder_and_upcast_attn: bool = False,
         # Additional parameters for LatentGPT2
-        window_size=4,
-        num_hidden_layers_encoder=6,
-        num_hidden_layers_decoder=6,
-        num_hidden_layers_fm=10,
-        pad_token_id=50256,
-        fm_min_sigma=0.01,
+        window_size: int = 4,
+        num_hidden_layers_encoder: int = 6,
+        num_hidden_layers_decoder: int = 6,
+        num_hidden_layers_fm: int = 10,
+        pad_token_id: int = 50256,
+        fm_min_sigma: float = 0.01,
+        fm_num_train_timesteps: int = 1000,
         **kwargs,
-    ):
+    ) -> None:
         super().__init__(
             vocab_size=vocab_size,
             n_positions=n_positions,
@@ -192,18 +199,20 @@ class LatentGPT2Config(GPT2Config):
         self.num_hidden_layers_fm = num_hidden_layers_fm
         self.pad_token_id = pad_token_id
         self.fm_min_sigma = fm_min_sigma
+        self.fm_num_train_timesteps = fm_num_train_timesteps
         
     @classmethod
     def build_from_pretrained(
         cls,
-        config,
-        window_size: Optional[int] = 4,
-        num_hidden_layers_encoder: Optional[int] = 6,
-        num_hidden_layers_decoder: Optional[int] = 6,
-        num_hidden_layers_fm: Optional[int] = 10,
-        pad_token_id: Optional[int] = 50256,
-        fm_min_sigma: Optional[float] = 0.01,
-    ):
+        config: GPT2Config,
+        window_size: int = 4,
+        num_hidden_layers_encoder: int = 6,
+        num_hidden_layers_decoder: int = 6,
+        num_hidden_layers_fm: int = 10,
+        pad_token_id: int = 50256,
+        fm_min_sigma: float = 0.01,
+        fm_num_train_timesteps: int = 1000,
+    ) -> "LatentGPT2Config":
         """
         Builds a new instance of the LatentGPT2Config from a pre-trained model.
 
@@ -216,6 +225,7 @@ class LatentGPT2Config(GPT2Config):
             num_hidden_layers_fm: The number of hidden layers in the flow matching.
             pad_token_id: The id of the padding token.
             fm_min_sigma: The minimum sigma value for the flow matching.
+            fm_num_train_timesteps: The training timestep for the flow matching.
 
         Returns:
             A new instance of the class.
@@ -229,6 +239,7 @@ class LatentGPT2Config(GPT2Config):
                 "num_hidden_layers_fm": num_hidden_layers_fm,
                 "pad_token_id": pad_token_id,
                 "fm_min_sigma": fm_min_sigma,
+                "fm_num_train_timesteps": fm_num_train_timesteps,
             }
         )
         return cls(**base_kwargs)

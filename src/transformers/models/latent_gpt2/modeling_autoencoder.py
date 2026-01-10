@@ -1619,6 +1619,97 @@ class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
         self.encoder.init_weight_from_pretrained(pretrained_model=pretrained_model)
         self.decoder.init_weight_from_pretrained(pretrained_model=pretrained_model)
         return self
+    
+    def encode(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        token_type_ids: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        **kwargs,
+    ) -> Union[tuple, CausalLMAutoencoderOutputWithCrossAttentions]:
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        encoder_output = self.encoder(
+            input_ids=input_ids,
+            past_key_values=past_key_values,
+            attention_mask=attention_mask,
+            cache_position=cache_position,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
+            # past_key_values=None,
+            # attention_mask=None,
+            # cache_position=None,
+            # token_type_ids=None,
+            # position_ids=None,
+            # inputs_embeds=None,
+            # encoder_hidden_states=None,
+            # encoder_attention_mask=None,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+        return encoder_output
+    
+    def decode(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        token_type_ids: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        **kwargs,
+    ) -> Union[tuple, CausalLMAutoencoderOutputWithCrossAttentions]:
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        
+        decoder_output = self.decoder(
+            input_ids=None,
+            past_key_values=past_key_values,
+            attention_mask=attention_mask,
+            cache_position=cache_position,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            # past_key_values=None,
+            # attention_mask=None,
+            # cache_position=None,
+            # token_type_ids=None,
+            # position_ids=None,
+            inputs_embeds=encoder_output.last_tail_hidden_state,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
+            # encoder_hidden_states=None,
+            # encoder_attention_mask=None,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=True,
+        )
+        return decoder_output
 
     def forward(
         self,
@@ -1703,28 +1794,11 @@ class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
                 **kwargs,
             )
 
-        # When use_latent_ar=True, return tuple of (ar_outputs, ltar_output, encoder_output)
-        # for the trainer to compute AR loss and flow matching loss
-        if use_latent_ar:
-            ar_outputs = CausalLMAutoencoderOutputWithCrossAttentions(
-                last_tail_hidden_state=decoder_output.last_tail_hidden_state,
-                last_hidden_state=decoder_output.last_hidden_state,
-                loss=loss,
-                logits=logits,
-                past_key_values=decoder_output.past_key_values,
-                hidden_states=decoder_output.hidden_states,
-                attentions=decoder_output.attentions,
-                cross_attentions=decoder_output.cross_attentions,
-            )
-            # ltar_output is the latent AR prediction (placeholder: using encoder_output for now)
-            # encoder_output contains the actual encoder latents
-            return (ar_outputs, encoder_output, encoder_output)
-
         if not return_dict:
             output = (logits,) + decoder_output[1:]
             return ((loss,) + output) if loss is not None else output
 
-        return CausalLMAutoencoderOutputWithCrossAttentions(
+        combined_output = CausalLMAutoencoderOutputWithCrossAttentions(
             last_tail_hidden_state=decoder_output.last_tail_hidden_state,
             last_hidden_state=decoder_output.last_hidden_state,
             loss=loss,
@@ -1734,6 +1808,14 @@ class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
             attentions=decoder_output.attentions,
             cross_attentions=decoder_output.cross_attentions,
         )
+        
+        # When use_latent_ar=True, return tuple of (ar_outputs, ltar_output, encoder_output)
+        # for the trainer to compute AR loss and flow matching loss
+        if use_latent_ar:
+            # ltar_output is the latent AR prediction (placeholder: using encoder_output for now)
+            # encoder_output contains the actual encoder latents
+            return (combined_output, encoder_output, encoder_output)
+        return combined_output
 
 # @auto_docstring(
 #     custom_intro="""
