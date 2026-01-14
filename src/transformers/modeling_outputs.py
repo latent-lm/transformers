@@ -783,7 +783,18 @@ class PreprocessOutput:
     
     """
     input_ids: torch.LongTensor
+    inputs_latents: torch.FloatTensor
     inputs_embeds: torch.FloatTensor
+    
+    def __init__(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        inputs_latents: Optional[torch.FloatTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+    ):
+        self.input_ids = input_ids
+        self.inputs_latents = inputs_latents
+        self.inputs_embeds = inputs_embeds
 
 @dataclass
 class CausalLMAutoencoderOutputWithCrossAttentions(ModelOutput):
@@ -824,7 +835,9 @@ class CausalLMAutoencoderOutputWithCrossAttentions(ModelOutput):
 
             Contains pre-computed hidden-states (key and values in the attention blocks) that can be used (see
             `past_key_values` input) to speed up sequential decoding.
-        latents (`torch.FloatTensor` of shape `(batch_size, segment_num, config.hidden_size)`):
+        latent_embeds (`torch.FloatTensor` of shape `(batch_size, segment_num, config.hidden_size)`):
+            The embedding (hidden_state) of the latent of the input sequence.
+        latents (`torch.FloatTensor` of shape `(batch_size, segment_num, config.latent_dim)`):
             The latent of the input sequence.
     """
 
@@ -836,6 +849,7 @@ class CausalLMAutoencoderOutputWithCrossAttentions(ModelOutput):
     hidden_states: Optional[tuple[torch.FloatTensor, ...]] = None
     attentions: Optional[tuple[torch.FloatTensor, ...]] = None
     cross_attentions: Optional[tuple[torch.FloatTensor, ...]] = None
+    latent_embeds: Optional[torch.FloatTensor] = None
     latents: Optional[torch.FloatTensor] = None
     
 @dataclass
