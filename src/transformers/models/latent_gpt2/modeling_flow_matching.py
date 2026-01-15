@@ -427,7 +427,7 @@ class LanguageFlowMatchingBase(GPT2ModelBase):
         self.wte = copy.deepcopy(pretrained_model.wte)
         self.wpe = copy.deepcopy(pretrained_model.wpe)
         self.drop = copy.deepcopy(pretrained_model.drop)
-        self.h = copy.deepcopy(pretrained_model.h[self.config.num_hidden_layers_encoder:self.config.num_hidden_layers_encoder+self.config.num_hidden_layers_encoder + self.config.num_hidden_layers_fm])
+        self.h = copy.deepcopy(pretrained_model.h[self.config.num_hidden_layers_encoder:self.config.num_hidden_layers_encoder + self.config.num_hidden_layers_fm])
         self.ln_f = copy.deepcopy(pretrained_model.ln_f)
         self.gradient_checkpointing = pretrained_model.gradient_checkpointing
 
@@ -438,8 +438,8 @@ class LanguageFlowMatchingBase(GPT2ModelBase):
                 block.crossattention.layer_idx = new_idx
         return self
     
-    def __rand_latent(self, batch_size: int):
-        return torch.randn(batch_size, 1, self.config.n_embd)
+    def _rand_latent(self, batch_size: int, device: Optional[torch.device] = None):
+        return torch.randn(batch_size, 1, self.config.n_embd, device=device)
     
     def __encode_prev_latent_with_timestep(
         self,
@@ -472,7 +472,7 @@ class LanguageFlowMatchingBase(GPT2ModelBase):
         if inputs_embeds is None:
             raise Warning("inputs_embeds shouldn't be None")
         if inputs_prev_latent is None:
-            inputs_prev_latent = self.__rand_latent(batch_size=input_ids.shape[0])
+            inputs_prev_latent = self._rand_latent(batch_size=inputs_embeds.shape[0], device=inputs_embeds.device)
         
         encoded_prev_latent: torch.FloatTensor = self.__encode_prev_latent_with_timestep(
             inputs_prev_latent=inputs_prev_latent,
@@ -608,6 +608,12 @@ class LanguageFlowMatching(GPT2PreTrainedModel, GenerationMixin):
         **kwargs,
     ) -> Union[tuple, CausalLMFlowMatchingOutputWithCrossAttentions]:
         r"""
+        inputs_prev_latent (`torch.FloatTensor` of shape `(batch_size, 1, hidden_dim)`, *optional*):
+            The previous latent representation. If not provided during training (when labels are given),
+            it will be sampled randomly based on the timestep and labels.
+        inputs_latent_timestep (`torch.FloatTensor` of shape `(batch_size,)`, *optional*):
+            The latent timestep with range [0, 1]. If not provided during training (when labels are given),
+            it will be randomly sampled.
         input_ids (`torch.LongTensor` of shape `(batch_size, input_ids_length)`):
             `input_ids_length` = `sequence_length` if `past_key_values` is `None` else
             `past_key_values.get_seq_length()` (`sequence_length` of input past key value states). Indices of input
@@ -627,12 +633,14 @@ class LanguageFlowMatching(GPT2PreTrainedModel, GenerationMixin):
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         
-        inputs_prev_latent, inputs_latent_timestep = self._get_inputs(
+        print(f"labels: {labels.shape}")
+        inputs_prev_latent, inputs_latent_timestep, velocity = self._get_inputs_outputs(
             inputs_prev_latent=inputs_prev_latent,
             inputs_latent_timestep=inputs_latent_timestep,
             inputs_embeds=inputs_embeds,
             labels=labels,
         )
+        print(f"inputs_prev_latent: {inputs_prev_latent.shape}, inputs_latent_timestep: {inputs_latent_timestep.shape}")
 
         transformer_outputs = self.transformer(
             inputs_prev_latent=inputs_prev_latent,
@@ -664,8 +672,8 @@ class LanguageFlowMatching(GPT2PreTrainedModel, GenerationMixin):
         if labels is not None:
             # Flatten the tokens
             loss = self.loss_function(
-                logits,
-                labels,
+                logits=logits,
+                labels=velocity,
                 vocab_size=self.config.vocab_size,
                 **kwargs,
             )
@@ -694,9 +702,9 @@ class LanguageFlowMatching(GPT2PreTrainedModel, GenerationMixin):
         **kwargs,
     ) -> torch.Tensor:
         dim = list(range(1, len(logits.shape)))
-        return torch.norm(logits - labels, dim=dim, p=2).mean()
+        return torch.norm(logits - labels , dim=dim, p=2).mean()
     
-    def _get_inputs(
+    def _get_inputs_outputs(
         self,
         inputs_prev_latent: Optional[torch.FloatTensor],
         inputs_latent_timestep: Optional[torch.FloatTensor],
@@ -708,16 +716,29 @@ class LanguageFlowMatching(GPT2PreTrainedModel, GenerationMixin):
         """
         if labels is not None:
             # Training mode
-            if inputs_latent_timestep is None and inputs_prev_latent is None::
+            if inputs_latent_timestep is None and inputs_prev_latent is None:
                 # If both inputs_latent_timestep and inputs_prev_latent are not provided, random sample
-                inputs_latent_timestep = torch.rand(labels.shape[0])
-                inputs_prev_latent =  inputs_latent_timestep * labels + (1.0 - inputs_latent_timestep) * self.__rand_latent(batch_size=labels.shape[0])
-            elif inputs_latent_timestep not is None and inputs_prev_latent is not None:
+                inputs_latent_timestep = torch.rand(labels.shape[0], device=labels.device)
+                noise = self.transformer._rand_latent(batch_size=labels.shape[0], device=labels.device)
+                # Expand timestep for broadcasting: (batch_size,) -> (batch_size, 1, 1) for (batch_size, seq_len, hidden_dim)
+                t_expanded = inputs_latent_timestep.view(-1, 1, 1)
+                inputs_prev_latent = t_expanded * labels + (1.0 - t_expanded) * noise
+            elif inputs_latent_timestep is not None and inputs_prev_latent is not None:
                 # If both inputs_latent_timestep and inputs_prev_latent are provided, use it for training
-                pass
+                t_expanded = inputs_latent_timestep.view(-1, 1, 1)
+                noise = (inputs_prev_latent - t_expanded * labels) /  (1.0 - t_expanded)
             else:
                 raise ValueError("Arguements inputs_prev_latent and inputs_latent_timestep should be both provided or not provided.")
-        return inputs_prev_latent, inputs_latent_timestep
+            velocity = labels - noise
+        else:
+            # Inference mode
+            if inputs_prev_latent is None:
+                raise ValueError("If labels is missing, inputs_prev_latent, inputs_latent_timestep, and inputs_embeds are required, but inputs_prev_latent is missing.")
+            if inputs_latent_timestep is None:
+                raise ValueError("If labels is missing, inputs_prev_latent, inputs_latent_timestep, and inputs_embeds are required, but inputs_latent_timestep is missing.")
+            if inputs_embeds is None:
+                raise ValueError("If labels is missing, inputs_prev_latent, inputs_latent_timestep, and inputs_embeds are required, but inputs_embeds is missing.")
+        return inputs_prev_latent, inputs_latent_timestep, velocity
     
     def _simple_model_call(
         self,
@@ -761,7 +782,7 @@ class LanguageFlowMatching(GPT2PreTrainedModel, GenerationMixin):
                 inputs_embeds=inputs_embeds,
             )
             v = output.last_latent
-            x = x + v * dt
+            x = inputs_prev_latent + v * dt
         elif method == 'midpoint':
             # Mid point method (more accurate)
             output1: CausalLMFlowMatchingOutputWithCrossAttentions = self._simple_model_call(
@@ -770,15 +791,15 @@ class LanguageFlowMatching(GPT2PreTrainedModel, GenerationMixin):
                 inputs_embeds=inputs_embeds,
             )
             v1 = output1.last_latent
-            x_mid = x + v1 * (dt / 2)
+            x_mid = inputs_prev_latent + v1 * (dt / 2)
             t_mid = inputs_latent_timestep + dt / 2
             output2: CausalLMFlowMatchingOutputWithCrossAttentions = self._simple_model_call(
                 inputs_prev_latent=x_mid,
-                inputs_latent_timestep=t_mid, 
+                inputs_latent_timestep=t_mid,
                 inputs_embeds=inputs_embeds,
             )
             v2 = output2.last_latent
-            x = x + v2 * dt
+            x = inputs_prev_latent + v2 * dt
         else:
             raise ValueError(f"Unknown method: {method}")
         return CausalLMFlowMatchingSamplingOutputWithCrossAttentions(
@@ -825,7 +846,7 @@ class LanguageFlowMatching(GPT2PreTrainedModel, GenerationMixin):
         
         # Start from Gaussian noise
         if inputs_prev_latent is None:
-            inputs_prev_latent = self.transformers.__rand_latent(batch_size=batch_size).to(device)
+            inputs_prev_latent = self.transformer._rand_latent(batch_size=batch_size, device=device)
         # Set up inference timestep
         timestep_base: torch.FloatTensor = torch.ones(batch_size).float().to(device)
         if inputs_latent_timestep is None:
