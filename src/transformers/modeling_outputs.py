@@ -317,6 +317,7 @@ class BaseAutoencoderOutputWithPastAndCrossAttentions(ModelOutput):
     """
 
     last_tail_hidden_state: Optional[torch.FloatTensor] = None
+    last_window_hidden_state: Optional[torch.FloatTensor] = None
     last_hidden_state: Optional[torch.FloatTensor] = None
     past_key_values: Optional[Cache] = None
     hidden_states: Optional[tuple[torch.FloatTensor, ...]] = None
@@ -804,6 +805,7 @@ class CausalLMAutoencoderOutputWithCrossAttentions(ModelOutput):
     Args:
         last_tail_hidden_states (`torch.FloatTensor` of shape `(batch_size, segment_num, config.hidden_size)` for encoder ouput and `(batch_size, 1, config.hidden_size)` for decoder output):
             The tail hidden state of the last layer of the transformer.
+        last_window_hidden_state 
         last_hidden_states (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)` for encoder ouput and `(batch_size, 1, config.hidden_size)` for decoder output):
             Sequence of hidden-states at the output of the last layer of the model.
 
@@ -842,6 +844,7 @@ class CausalLMAutoencoderOutputWithCrossAttentions(ModelOutput):
     """
 
     last_tail_hidden_state: Optional[torch.FloatTensor] = None
+    last_window_hidden_state: Optional[torch.FloatTensor] = None
     last_hidden_state: Optional[torch.FloatTensor] = None
     loss: Optional[torch.FloatTensor] = None
     logits: Optional[torch.FloatTensor] = None
