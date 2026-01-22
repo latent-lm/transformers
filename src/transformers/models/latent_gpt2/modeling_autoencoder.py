@@ -335,6 +335,19 @@ class LanguageDecoderUtils(SequenceWindowUtilsBase):
         """
         flatten_seq_shape = (self._batch_size, self._segment_num * self._window_size, *logits[0].shape[2:])
         return torch.stack(logits, dim=2).view(flatten_seq_shape)
+    
+    def pad(self, sequence: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Pad the given sequence to be a multiple of window_size.
+
+        If sequence is None, return None.
+        For 2D sequence (batch_size, seq_len), pad with padding_token.
+        For 3D sequence (batch_size, seq_len, embedding_size), pad with padding_embed.
+
+        Returns:
+            torch.Tensor: Padded sequence with length divisible by window_size.
+        """
+        return self._pad(sequence=sequence, token_type=SequenceWindowUtilsBase.TOKEN_TYPE_PADDING)
 
 @auto_docstring(
     custom_intro="Language encoder model based on GPT-2 for encoding text into latent representations.",
@@ -1076,10 +1089,12 @@ class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
 
         loss = None
         if labels is not None:
+            # Pad labels to make it can be divided by self.config.window_size
+            padded_labels: torch.LongTensor = self.decoder.transformer.ae_utils.pad(sequence=labels)
             # Flatten the tokens
             loss = self.loss_function(
                 logits=logits,
-                labels=labels,
+                labels=padded_labels,
                 vocab_size=self.config.vocab_size,
                 **kwargs,
             )
@@ -1124,14 +1139,15 @@ class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
             logits = logits[..., :-shift_labels, :].contiguous()
             labels = labels[..., shift_labels:].contiguous()
 
-        # TODO: Claude Code update, double check, Ensure logits and labels have the same sequence length
-        logits_seq_len = logits.size(-2)
-        labels_seq_len = labels.size(-1)
-        if logits_seq_len != labels_seq_len:
-            min_len = min(logits_seq_len, labels_seq_len)
-            logits = logits[..., :min_len, :].contiguous()
-            labels = labels[..., :min_len].contiguous()
-        # TODO: Claude Code update ends
+        # Claude Code update, double check, Ensure logits and labels have the same sequence length
+        # I've added a padding function for labels, making logits and labels have the same length. Labels sometimes cannot be devided by the self.config.window_size
+        # logits_seq_len = logits.size(-2)
+        # labels_seq_len = labels.size(-1)
+        # if logits_seq_len != labels_seq_len:
+        #     min_len = min(logits_seq_len, labels_seq_len)
+        #     logits = logits[..., :min_len, :].contiguous()
+        #     labels = labels[..., :min_len].contiguous()
+        # Claude Code update ends
 
         log_probs = -nn.functional.log_softmax(logits, dim=-1)
         if labels.dim() == log_probs.dim() - 1:

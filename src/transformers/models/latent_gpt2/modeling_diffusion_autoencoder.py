@@ -13,7 +13,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""PyTorch OpenAI GPT-2 model."""
 
 import copy
 import math
@@ -48,12 +47,15 @@ from .modeling_autoencoder import LanguageEncoderLatentHead, LanguageDecoderBase
 
 logger = logging.get_logger(__name__)
         
-@auto_docstring(
-    custom_intro="Language decoder model based on GPT-2 for decoding latent representations back to text.",
-    custom_args="window_size (`int`): The window size for disaggregating latent representations back to sequences.",
-)
 class LanguageDiffusionDecoder(LanguageDecoderBase):
     def __init__(self, config: LatentGPT2Config):
+        """
+        Initialize the LanguageDiffusionDecoder.
+
+        Args:
+            config ([`LatentGPT2Config`]):
+                Configuration object containing model hyperparameters.
+        """
         super().__init__(config)
         self.ae_utils = LanguageDecoderUtils(
             window_size=config.window_size,
@@ -76,11 +78,13 @@ class LanguageDiffusionDecoder(LanguageDecoderBase):
 
         Args:
             input_ids (Optional[torch.LongTensor]): The input ids.
+            inputs_latents (Optional[torch.FloatTensor]): The input embeddings. 
             inputs_embeds (Optional[torch.FloatTensor]): The input embeddings.
 
         Returns:
             A PreprocessOutput containing the pre-processed input ids and embeddings.
         """
+            
         if input_ids is not None:
             input_ids = self.ae_utils.agg_sequence_mask_diffusion(sequence=input_ids)
         if inputs_latents is not None:
@@ -89,6 +93,9 @@ class LanguageDiffusionDecoder(LanguageDecoderBase):
             inputs_embeds = self.ae_utils.agg_sequence(sequence=inputs_embeds)
             if inputs_latents is not None:
                 raise ValueError(f"inputs_latents and inputs_embeds are provided at the same time, only one of them is accepted.")
+            if input_ids is not None:
+                raise ValueError(f"input_ids and inputs_embeds are provided at the same time, only one of them is accepted.")
+            return PreprocessOutput(input_ids=input_ids, inputs_latents=inputs_latents, inputs_embeds=inputs_embeds)
 
         if inputs_latents is not None:
             inputs_embeds = self.wte_latent(inputs_latents)
@@ -98,7 +105,7 @@ class LanguageDiffusionDecoder(LanguageDecoderBase):
         else:
             # If there is no input masked sequecne, random sample a fully masked sequence
             # Concatenate Partially / Fully Masked target sequence
-            masked_input_ids: torch.LongTensor = (torch.ones(*inputs_embeds.shape[:-1]) * self.config.pad_token_id).long().to(self.device)
+            masked_input_ids: torch.LongTensor = (torch.ones(*(inputs_embeds.shape[:-2] + (self.config.window_size, ))) * self.config.mask_token_id).long().to(self.device)
             masked_input_embeds: torch.FloatTensor = self.wte(masked_input_ids)
 
         full_inputs_embeds: torch.FloatTensor = torch.cat([inputs_embeds, masked_input_embeds], dim=-2)
@@ -376,54 +383,54 @@ class LanguageDiffusionAutoencoder(GPT2PreTrainedModel, GenerationMixin):
             Masked token sequence of shape (batch_size, seq_len) where some tokens
             are replaced with mask_token_id based on the masking ratio.
         """
-        if labels is None:
-            return None
+        # if labels is None:
+        return None
 
-        # TODO: Clip the label to avoid the token id execeed vocab_size, but why labels has token execeed voacb_size?
-        # Clamp labels to be within the vocab size
-        # print(f"Before labels: {labels.shape}, max: {torch.max(labels)}, min: {torch.min(labels)}")
-        labels = torch.clamp(labels, min=0, max=self.config.vocab_size - 1)
-        # print(f"After labels: {labels.shape}, max: {torch.max(labels)}, min: {torch.min(labels)}")
+        # # TODO: Clip the label to avoid the token id execeed vocab_size, but why labels has token execeed voacb_size?
+        # # Clamp labels to be within the vocab size
+        # # print(f"Before labels: {labels.shape}, max: {torch.max(labels)}, min: {torch.min(labels)}")
+        # labels = torch.clamp(labels, min=0, max=self.config.vocab_size - 1)
+        # # print(f"After labels: {labels.shape}, max: {torch.max(labels)}, min: {torch.min(labels)}")
 
-        batch_size, seq_len = labels.shape
-        device = labels.device
-        num_timesteps: int = self.config.dae_num_train_timesteps
-        mask_token_id: int = self.config.mask_token_id
+        # batch_size, seq_len = labels.shape
+        # device = labels.device
+        # num_timesteps: int = self.config.dae_num_train_timesteps
+        # mask_token_id: int = self.config.mask_token_id
 
-        masking_ratios: torch.FloatTensor = None
-        if num_timesteps is None:
-            # If num_timesteps is None, use continuous timestep
-            masking_ratios = torch.rand((batch_size, 1), device=device, dtype=torch.float)
-        else:
-            # If num_timesteps is None, use discrete timestep
-            # Sample timestep uniformly from [0, num_timesteps] for each sample in batch
-            if timestep is not None:
-                # Use provided timestep for all samples
-                timesteps = torch.full((batch_size, 1), timestep, device=device, dtype=torch.long)
-            else:
-                # Sample random timestep for each sample: t in {0, 1, 2, ..., num_timesteps}
-                timesteps = torch.randint(0, num_timesteps + 1, (batch_size, 1), device=device)
+        # masking_ratios: torch.FloatTensor = None
+        # if num_timesteps is None:
+        #     # If num_timesteps is None, use continuous timestep
+        #     masking_ratios = torch.rand((batch_size, 1), device=device, dtype=torch.float)
+        # else:
+        #     # If num_timesteps is None, use discrete timestep
+        #     # Sample timestep uniformly from [0, num_timesteps] for each sample in batch
+        #     if timestep is not None:
+        #         # Use provided timestep for all samples
+        #         timesteps = torch.full((batch_size, 1), timestep, device=device, dtype=torch.long)
+        #     else:
+        #         # Sample random timestep for each sample: t in {0, 1, 2, ..., num_timesteps}
+        #         timesteps = torch.randint(0, num_timesteps + 1, (batch_size, 1), device=device)
 
-            # Compute masking ratio for each sample: ratio = t / num_timesteps
-            # Shape: (batch_size, 1) for broadcasting
-            if num_timesteps == 0:
-                # If num_timesteps == 0, only trained on fully masked sequence
-                masking_ratios = torch.ones((batch_size, 1), device=device, dtype=torch.float)
-            else:
-                # If num_timesteps > 0, trained on fully and paritally masked sequence
-                masking_ratios = timesteps.float() / num_timesteps
-            # masking_ratios = masking_ratios.unsqueeze(-1)  # (batch_size, 1)
+        #     # Compute masking ratio for each sample: ratio = t / num_timesteps
+        #     # Shape: (batch_size, 1) for broadcasting
+        #     if num_timesteps == 0:
+        #         # If num_timesteps == 0, only trained on fully masked sequence
+        #         masking_ratios = torch.ones((batch_size, 1), device=device, dtype=torch.float)
+        #     else:
+        #         # If num_timesteps > 0, trained on fully and paritally masked sequence
+        #         masking_ratios = timesteps.float() / num_timesteps
+        #     # masking_ratios = masking_ratios.unsqueeze(-1)  # (batch_size, 1)
 
-        # Generate random values for each position
-        random_probs = torch.rand(batch_size, seq_len, device=device)
-        # Create mask: True where we should mask (random < masking_ratio)
-        mask = random_probs < masking_ratios
+        # # Generate random values for each position
+        # random_probs = torch.rand(batch_size, seq_len, device=device)
+        # # Create mask: True where we should mask (random < masking_ratio)
+        # mask = random_probs < masking_ratios
 
-        # Apply masking: replace masked positions with mask_token_id
-        masked_labels = labels.clone()
-        masked_labels.masked_fill_(mask, mask_token_id)
+        # # Apply masking: replace masked positions with mask_token_id
+        # masked_labels = labels.clone()
+        # masked_labels.masked_fill_(mask, mask_token_id)
 
-        return masked_labels
+        # return masked_labels
 
     def encode(
         self,
@@ -598,11 +605,13 @@ class LanguageDiffusionAutoencoder(GPT2PreTrainedModel, GenerationMixin):
 
         loss = None
         if labels is not None:
+            # Pad labels to make it can be divided by self.config.window_size
+            padded_labels: torch.LongTensor = self.decoder.transformer.ae_utils.pad(sequence=labels)
             # Flatten the tokens
             loss = self.loss_function(
                 # Skip the logit at the first dimension, which is the output corresponsing to the latent
                 logits=logits,
-                labels=labels,
+                labels=padded_labels,
                 vocab_size=self.config.vocab_size,
                 **kwargs,
             )
@@ -647,14 +656,15 @@ class LanguageDiffusionAutoencoder(GPT2PreTrainedModel, GenerationMixin):
             logits = logits[..., :-shift_labels, :].contiguous()
             labels = labels[..., shift_labels:].contiguous()
 
-        # TODO: Claude Code update, double check, Ensure logits and labels have the same sequence length
-        logits_seq_len = logits.size(-2)
-        labels_seq_len = labels.size(-1)
-        if logits_seq_len != labels_seq_len:
-            min_len = min(logits_seq_len, labels_seq_len)
-            logits = logits[..., :min_len, :].contiguous()
-            labels = labels[..., :min_len].contiguous()
-        # TODO: Claude Code update ends
+        # Claude Code update, double check, Ensure logits and labels have the same sequence length
+        # I've added a padding function for labels, making logits and labels have the same length. Labels sometimes cannot be devided by the self.config.window_size
+        # logits_seq_len = logits.size(-2)
+        # labels_seq_len = labels.size(-1)
+        # if logits_seq_len != labels_seq_len:
+        #     min_len = min(logits_seq_len, labels_seq_len)
+        #     logits = logits[..., :min_len, :].contiguous()
+        #     labels = labels[..., :min_len].contiguous()
+        # Claude Code update ends
 
         log_probs = -nn.functional.log_softmax(logits, dim=-1)
         if labels.dim() == log_probs.dim() - 1:
