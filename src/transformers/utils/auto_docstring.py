@@ -70,6 +70,7 @@ HARDCODED_CONFIG_FOR_MODELS = {
     "lasr": "LasrCTCConfig",
     "autoencoder": "LatentGPT2Config",
     "flow-matching": "LatentGPT2Config",
+    "diffusion-autoencoder": "LatentGPT2Config",
 }
 
 _re_checkpoint = re.compile(r"\[(.+?)\]\((https://huggingface\.co/.+?)\)")

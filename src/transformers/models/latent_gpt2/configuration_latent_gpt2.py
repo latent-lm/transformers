@@ -113,6 +113,8 @@ class LatentGPT2Config(GPT2Config):
             Number of hidden layers in the flow matching stack.
         pad_token_id (`int`, *optional*, defaults to 50256):
             Id of the padding token in the vocabulary.
+        fm_num_train_timesteps (`int`, *optional*, defaults to 1000):
+            The training timesteps for the flow matching.
         fm_min_sigma (`float`, *optional*, defaults to 0.01):
             The minimum sigma value for the flow matching noise schedule.
         fm_num_train_timesteps (`int`, *optional*, defaults to 1000):
@@ -135,16 +137,22 @@ class LatentGPT2Config(GPT2Config):
     """
 
     model_type = "latent_gpt2"
+    AUTOENCODER_TYPE_MULTI_HEAD: str = "multi_head"
+    AUTOENCODER_TYPE_DIFFUSION: str = "diffusion"
 
     def __init__(
         self,
         # Latent-specific parameters
         window_size: int = 4,
         latent_dim: int = 768,
+        autoencoder_type: str = "multi_head",
         num_hidden_layers_encoder: int = 6,
         num_hidden_layers_decoder: int = 6,
         num_hidden_layers_fm: int = 10,
         pad_token_id: int = 50256,
+        mask_token_id: int = 50256,
+        # Diffusion Autoencoder paramters
+        dae_num_train_timesteps: int = 0,
         # Flow matching parameters
         fm_min_sigma: float = 0.01,
         fm_num_train_timesteps: int = 1000,
@@ -153,19 +161,24 @@ class LatentGPT2Config(GPT2Config):
     ) -> None:
         # Set pad_token_id in kwargs for parent class
         kwargs.setdefault("pad_token_id", pad_token_id)
+        kwargs.setdefault("mask_token_id", mask_token_id)
 
         super().__init__(**kwargs)
 
         # Latent architecture parameters
-        self.window_size = window_size
-        self.latent_dim = latent_dim
-        self.num_hidden_layers_encoder = num_hidden_layers_encoder
-        self.num_hidden_layers_decoder = num_hidden_layers_decoder
-        self.num_hidden_layers_fm = num_hidden_layers_fm
+        self.window_size: int = window_size
+        self.latent_dim: int = latent_dim
 
+        # Autoencoder parameters
+        self.autoencoder_type: str = autoencoder_type
+        self.num_hidden_layers_encoder: int = num_hidden_layers_encoder
+        self.num_hidden_layers_decoder: int = num_hidden_layers_decoder
+        # Diffusion Autoencoder paramters
+        self.dae_num_train_timesteps: int = dae_num_train_timesteps
         # Flow matching parameters
-        self.fm_min_sigma = fm_min_sigma
-        self.fm_num_train_timesteps = fm_num_train_timesteps
+        self.num_hidden_layers_fm: int = num_hidden_layers_fm
+        self.fm_min_sigma: float = fm_min_sigma
+        self.fm_num_train_timesteps: int = fm_num_train_timesteps
 
     @classmethod
     def build_from_pretrained(
@@ -173,10 +186,13 @@ class LatentGPT2Config(GPT2Config):
         config: GPT2Config,
         window_size: int = 4,
         latent_dim: int = 768,
+        autoencoder_type: str = "multi_head",
         num_hidden_layers_encoder: int = 6,
         num_hidden_layers_decoder: int = 6,
         num_hidden_layers_fm: int = 10,
         pad_token_id: Optional[int] = None,
+        mask_token_id: Optional[int] = None,
+        dae_num_train_timesteps: int = 0,
         fm_min_sigma: float = 0.01,
         fm_num_train_timesteps: int = 1000,
     ) -> "LatentGPT2Config":
@@ -190,6 +206,8 @@ class LatentGPT2Config(GPT2Config):
                 The window size for the latent encoder/decoder.
             latent_dim (`int`, *optional*, defaults to 768):
                 The latent dimension of the autoencoder.
+            autoencoder_type (`str`, *optional*, defaults to "multi_head"):
+                The type of autoencoder to use. Can be either "multi_head" or "diffusion")
             num_hidden_layers_encoder (`int`, *optional*, defaults to 6):
                 The number of hidden layers in the encoder.
             num_hidden_layers_decoder (`int`, *optional*, defaults to 6):
@@ -198,6 +216,10 @@ class LatentGPT2Config(GPT2Config):
                 The number of hidden layers in the flow matching.
             pad_token_id (`int`, *optional*):
                 The id of the padding token. If None, uses config.pad_token_id or config.eos_token_id.
+            mask_token_id (`int`, *optional*):
+                The id of the masking token. If None, uses config.mask_token_id or config.eos_token_id.
+            dae_num_train_timesteps (`int`, *optional*, defaults to 0):
+                The training timesteps for the diffusion autoencoder.
             fm_min_sigma (`float`, *optional*, defaults to 0.01):
                 The minimum sigma value for the flow matching.
             fm_num_train_timesteps (`int`, *optional*, defaults to 1000):
@@ -212,15 +234,21 @@ class LatentGPT2Config(GPT2Config):
         # Determine pad_token_id
         if pad_token_id is None:
             pad_token_id = getattr(config, "pad_token_id", None) or getattr(config, "eos_token_id", 50256)
+        # Determine mask_token_id
+        if mask_token_id is None:
+            mask_token_id = getattr(config, "mask_token_id", None) or getattr(config, "eos_token_id", 50256)
 
         # Add latent-specific parameters
         base_kwargs.update({
             "window_size": window_size,
             "latent_dim": latent_dim,
+            "autoencoder_type": autoencoder_type,
             "num_hidden_layers_encoder": num_hidden_layers_encoder,
             "num_hidden_layers_decoder": num_hidden_layers_decoder,
             "num_hidden_layers_fm": num_hidden_layers_fm,
             "pad_token_id": pad_token_id,
+            "mask_token_id": mask_token_id,
+            "dae_num_train_timesteps": dae_num_train_timesteps,
             "fm_min_sigma": fm_min_sigma,
             "fm_num_train_timesteps": fm_num_train_timesteps,
         })

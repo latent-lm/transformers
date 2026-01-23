@@ -107,202 +107,247 @@ class LanguageDecoderBase(GPT2ModelBase):
             with torch.no_grad():
                 self.wte_latent.weight.copy_(torch.eye(self.embed_dim))
 
-@auto_docstring(custom_intro="Base class for language encoding with fixed-size window aggregation.")
-class LanguageEncoderUtils:
+class SequenceWindowUtilsBase:
+    """Base class for sequence windowing utilities with shared properties and padding methods."""
+    TOKEN_TYPE_PADDING: str = "padding"
+    TOKEN_TYPE_MASKING: str = "masking"
+    SUPPORTED_TOKEN_TYPES: List[str] = [
+        TOKEN_TYPE_PADDING,
+        TOKEN_TYPE_MASKING
+    ]
+
     def __init__(
         self,
         window_size: int,
         padding_token: Optional[int] = None,
-        padding_embed: Optional[torch.Tensor] = None,
+        padding_embed: Optional[torch.FloatTensor] = None,
+        masking_token: Optional[int] = None,
+        masking_embed: Optional[torch.FloatTensor] = None,
         wte: Optional[torch.nn.Embedding] = None,
     ):
-        self.__batch_size: int = None
-        self.__seq_len: int = None
-        self.__segment_num: int = None
-        
-        self.__window_size: int = window_size  
-        self.__padding_token = padding_token
-        self.__padding_embed = padding_embed
-        self.__wte: torch.nn.Embedding = wte
-        
+        self._batch_size: int = None
+        self._seq_len: int = None
+        self._segment_num: int = None
+        self._window_size: int = window_size
+        self._padding_token = padding_token
+        self._padding_embed = padding_embed
+        self._masking_token = masking_token
+        self._masking_embed = masking_embed
+        self._wte: torch.nn.Embedding = wte
+
     @property
     def batch_size(self):
-        return self.__batch_size
+        return self._batch_size
 
     @property
     def seq_len(self):
-        return self.__seq_len
-    
+        return self._seq_len
+
     @property
     def segment_num(self):
-        return self.__segment_num
-    
+        return self._segment_num
+
     @property
     def window_size(self):
-        return self.__window_size
-    
-    def __get_padding_embed(self) -> torch.FloatTensor:
-        if self.__padding_embed is None:
-            if self.__wte is None:
+        return self._window_size
+
+    def _get_padding_embed(self) -> torch.FloatTensor:
+        if self._padding_embed is None:
+            if self._wte is None:
                 raise ValueError("To get padding_embed, either provide padding_embed or wte")
-            self.__padding_embed = self.__wte(self.__padding_token)
-        return self.__padding_embed
-    def __get_padding_token(self) -> torch.LongTensor:
-        if self.__padding_token is None:
+            self._padding_embed = self._wte(self._padding_token)
+        return self._padding_embed
+
+    def _get_padding_token(self) -> torch.LongTensor:
+        if self._padding_token is None:
             raise ValueError("padding_token is not set")
-        return self.__padding_token
-    def __pad(
-        self,
-        sequence: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
+        return self._padding_token
+    
+    def _get_masking_embed(self) -> torch.FloatTensor:
+        if self._masking_embed is None:
+            if self._wte is None:
+                raise ValueError("To get masking_embed, either provide masking_embed or wte")
+            self._masking_embed = self._wte(self._masking_token)
+        return self._masking_embed
+
+    def _get_masking_token(self) -> torch.LongTensor:
+        if self._masking_token is None:
+            raise ValueError("masking_token is not set")
+        return self._masking_token
+    
+    def _get_used_token(self, token_type: str):
+        if token_type == SequenceWindowUtilsBase.TOKEN_TYPE_PADDING:
+            return self._get_padding_token()
+        elif token_type == SequenceWindowUtilsBase.TOKEN_TYPE_MASKING:
+            return self._get_masking_token()
+        else:
+            raise ValueError(f"token_type, {token_type}, isn't supported, only support {SequenceWindowUtilsBase.SUPPORTED_TOKEN_TYPES}")
+        
+    def _get_used_embed(self, token_type: str):
+        if token_type == SequenceWindowUtilsBase.TOKEN_TYPE_PADDING:
+            return self._get_padding_embed()
+        elif token_type == SequenceWindowUtilsBase.TOKEN_TYPE_MASKING:
+            return self._get_masking_embed()
+        else:
+            raise ValueError(f"token_type, {token_type}, isn't supported, only support {SequenceWindowUtilsBase.SUPPORTED_TOKEN_TYPES}")
+
+    def _pad(self, sequence: Optional[torch.Tensor] = None, token_type: str = "padding") -> torch.Tensor:
         """
         Pad the given sequence to be a multiple of window_size.
-        
+
         If sequence is None, return None.
-        
         For 2D sequence (batch_size, seq_len), pad with padding_token.
         For 3D sequence (batch_size, seq_len, embedding_size), pad with padding_embed.
-        
-        Raises:
-            NotImplementedError: If the input dimension is not supported.
-        
+
         Returns:
-            torch.Tensor: Padded sequence. Shape is (batch_size, seq_len + pad) if sequence is 2D, otherwise (batch_size, seq_len + pad, embedding_size).
+            torch.Tensor: Padded sequence with length divisible by window_size.
         """
         if sequence is None:
             return sequence
         batch_size: int = sequence.shape[0]
         seq_len: int = sequence.shape[1]
+        pad_len: int = (self._window_size - (seq_len % self._window_size)) % self._window_size
+
+        if pad_len == 0:
+            return sequence
+
         if sequence.dim() == 2:
-            # input_ids shape: batch_size x seq_len
-            pad_len: int = (self.__window_size - (seq_len % self.__window_size)) % self.__window_size
-            pad = torch.ones((batch_size, pad_len), dtype=sequence.dtype, device=sequence.device) * self.__get_padding_token()
-            padded_sequence = torch.cat((sequence, pad), 1)  # input_ids shape: batch_size x seq_len + pad
+            pad = torch.full((batch_size, pad_len), self._get_used_token(token_type=token_type),
+                           dtype=sequence.dtype, device=sequence.device)
         elif sequence.dim() == 3:
-            # inputs_embeds shape: batch_size x seq_len x embedding size
-            pad_len: int = (self.__window_size - (seq_len % self.__window_size)) % self.__window_size
-            pad = torch.ones((batch_size, pad_len, sequence.shape[2]), dtype=sequence.dtype, device=sequence.device) * self.__get_padding_embed()
-            padded_sequence = torch.cat((sequence, pad), 1)  # input_ids shape: batch_size x seq_len + pad
+            pad = self._get_used_embed(token_type=token_type).expand(batch_size, pad_len, -1).to(
+                dtype=sequence.dtype, device=sequence.device)
         else:
             raise NotImplementedError(f"Unsupported input dimension: {sequence.dim()} with shape {sequence.shape}")
-        return padded_sequence
-    def agg_sequence(
-        self,
-        sequence: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        return torch.cat((sequence, pad), dim=1)
+
+    def split_sequence(self, sequence: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Split a windowed sequence back to batch dimensions."""
+        if sequence is None:
+            return sequence
+        return sequence.reshape(self._batch_size, self._segment_num * sequence.shape[1], *sequence.shape[2:])
+
+
+@auto_docstring(custom_intro="Utility class for language encoding with fixed-size window aggregation.")
+class LanguageEncoderUtils(SequenceWindowUtilsBase):
+    """Encoder utilities that aggregate sequences into fixed-size windows."""
+
+    def agg_sequence(self, sequence: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Aggregate a sequence into fixed-size windows.
 
         Args:
-            sequence (Optional[torch.Tensor]): The sequence to aggregate. For 2D sequence (batch_size, seq_len), pad with padding_token.
-                For 3D sequence (batch_size, seq_len, embedding_size), pad with padding_embed.
+            sequence: The sequence to aggregate. Shape (batch_size, seq_len) or (batch_size, seq_len, embed_dim).
 
         Returns:
-            torch.Tensor: The aggregated sequence. For 2D sequence (batch_size, seq_len), it would return (batch_size * self.__segment_num, self.__window_size).
-                For 3D sequence (batch_size * self.__segment_num, self.__window_size, embedding_size), where self.__segment_num = (seq_len + pad) // self.__window_size
+            Aggregated sequence with shape (batch_size * segment_num, window_size, ...).
         """
         if sequence is None:
             return sequence
-        self.__batch_size: int = sequence.shape[0]
-        self.__seq_len: int = sequence.shape[1]
-        padded_sequence = self.__pad(sequence=sequence)
-        self.__segment_num: int = padded_sequence.shape[1] // self.__window_size
-        return padded_sequence.view(self.__batch_size * self.__segment_num, self.__window_size, *padded_sequence.shape[2:])
-    def split_sequence(
+        self._batch_size = sequence.shape[0]
+        self._seq_len = sequence.shape[1]
+        padded_sequence = self._pad(sequence=sequence, token_type=SequenceWindowUtilsBase.TOKEN_TYPE_PADDING)
+        self._segment_num = padded_sequence.shape[1] // self._window_size
+        return padded_sequence.view(self._batch_size * self._segment_num, self._window_size, *padded_sequence.shape[2:])
+
+
+@auto_docstring(custom_intro="Utility class for language decoding with fixed-size window disaggregation.")
+class LanguageDecoderUtils(SequenceWindowUtilsBase):
+    """Decoder utilities that handle single-element and window-based sequence operations."""
+
+    def agg_sequence(self, sequence: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Aggregate a sequence into single-element segments.
+
+        Args:
+            sequence: The sequence to aggregate. Shape (batch_size, seq_len, ...).
+
+        Returns:
+            Aggregated sequence with shape (batch_size * seq_len, 1, ...).
+        """
+        if sequence is None:
+            return sequence
+        self._batch_size = sequence.shape[0]
+        self._seq_len = sequence.shape[1]
+        self._segment_num = sequence.shape[1]
+        return sequence.view(self._batch_size * self._segment_num, 1, *sequence.shape[2:])
+
+    def _agg_sequence_by_window(
         self,
         sequence: Optional[torch.Tensor] = None,
+        token_type: str = SequenceWindowUtilsBase.TOKEN_TYPE_PADDING,
     ) -> torch.Tensor:
         """
-        Split a sequence into fixed-size windows.
+        Internal method to aggregate a sequence into window_size-length segments.
 
         Args:
-            sequence (Optional[torch.Tensor]): The sequence to split, with size (batch_size * self.__segment_num, self.__window_size or 1, embedding_size)
+            sequence: The sequence to aggregate. Shape (batch_size, seq_len, ...).
+            token_type: Token type for padding ("padding" or "masking").
 
         Returns:
-            torch.Tensor: The split sequence into shape (batch_size, self.__segment_num * (self.__window_size or 1), embedding_size)
+            Aggregated sequence with shape (batch_size * segment_num, window_size, ...).
         """
         if sequence is None:
             return sequence
-        return sequence.view(self.__batch_size, self.__segment_num * sequence.shape[1], *sequence.shape[2:])
-    
-@auto_docstring(custom_intro="Base class for language decoding with fixed-size window disaggregation.")
-class LanguageDecoderUtils:
-    def __init__(
-        self,
-        window_size: int,
-    ):
-        self.__batch_size: int = None
-        self.__seq_len: int = None
-        self.__segment_num: int = None
-        
-        self.__window_size: int = window_size  
-        
-    @property
-    def batch_size(self):
-        return self.__batch_size
+        self._batch_size = sequence.shape[0]
+        self._seq_len = sequence.shape[1]
+        padded_sequence = self._pad(sequence=sequence, token_type=token_type)
+        self._segment_num = padded_sequence.shape[1] // self._window_size
+        return padded_sequence.view(self._batch_size * self._segment_num, self._window_size, *padded_sequence.shape[2:])
 
-    @property
-    def seq_len(self):
-        return self.__seq_len
-    
-    @property
-    def segment_num(self):
-        return self.__segment_num
-    
-    @property
-    def window_size(self):
-        return self.__window_size
-    
-    def agg_sequence(
-        self,
-        sequence: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    def agg_sequence_by_window_size(self, sequence: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        Aggregate a sequence into single element.
+        Aggregate a sequence into window_size-length segments, padding if necessary.
 
         Args:
-            sequence (Optional[torch.Tensor]): The sequence to aggregate. For 2D sequence (batch_size, seq_len), pad with padding_token.
-                For 3D sequence (batch_size, seq_len, embedding_size), pad with padding_embed.
+            sequence: The sequence to aggregate. Shape (batch_size, seq_len, ...).
 
         Returns:
-            torch.Tensor: The aggregated sequence. For 2D sequence (batch_size, seq_len), it would return (batch_size * self.__segment_num, 1).
-                For 3D sequence (batch_size * self.__segment_num, 1, embedding_size), where self.__segment_num = seq_len
+            Aggregated sequence with shape (batch_size * segment_num, window_size, ...).
         """
-        if sequence is None:
-            return sequence
-        self.__batch_size: int = sequence.shape[0]
-        self.__seq_len: int = sequence.shape[1]
-        self.__segment_num: int = sequence.shape[1]
-        return sequence.view(self.__batch_size * self.__segment_num, 1, *sequence.shape[2:])
-    def split_sequence(
-        self,
-        sequence: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        return self._agg_sequence_by_window(sequence, token_type=SequenceWindowUtilsBase.TOKEN_TYPE_PADDING)
+
+    def agg_sequence_mask_diffusion(self, sequence: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        Split a sequence back to original.
+        Aggregate a masked sequence into window_size-length segments for diffusion decoding.
+
+        Used in mask diffusion models where the decoder receives masked token IDs
+        that need to be reshaped to match the windowed structure. Pads with mask
+        tokens if sequence length is not divisible by window_size.
 
         Args:
-            sequence (Optional[torch.Tensor]): The sequence to split, with size (batch_size * self.__segment_num, 1, embedding_size), where self.__segment_num = seq_len
+            sequence: The masked token sequence. Shape (batch_size, seq_len, ...).
 
         Returns:
-            torch.Tensor: The split sequence into shape (batch_size, self.__segment_num, embedding_size), where self.__segment_num = seq_len
+            Aggregated sequence with shape (batch_size * segment_num, window_size, ...).
         """
-        if sequence is None:
-            return sequence
-        return sequence.view(self.__batch_size, self.__segment_num, *sequence.shape[2:])
-    def flatten_multi_heads_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        return self._agg_sequence_by_window(sequence, token_type=SequenceWindowUtilsBase.TOKEN_TYPE_MASKING)
+
+    def flatten_multi_heads_logits(self, logits: List[torch.Tensor]) -> torch.Tensor:
         """
-        Project decoder hidden states to logits using multi-head mechanism.
-        
+        Flatten multi-head logits into a single sequence.
+
         Args:
-            logits: list of tensors of shape (batch_size, self.__segment_num, vocab_size) with length self.__window_size
-        
+            logits: List of tensors of shape (batch_size, segment_num, vocab_size) with length window_size.
+
         Returns:
-            flattened_logits: Shape (batch_size, self.__segment_num * self.__window_size, vocab_size)
+            Flattened logits with shape (batch_size, segment_num * window_size, vocab_size).
         """
-        flatten_seq_shape = (self.__batch_size, self.__segment_num * self.__window_size, *logits[0].shape[2:])
-        # Stack to create tensor with shape: (batch_size, self.__segment_num,  self.__window_size, vocab_size)
+        flatten_seq_shape = (self._batch_size, self._segment_num * self._window_size, *logits[0].shape[2:])
         return torch.stack(logits, dim=2).view(flatten_seq_shape)
+    
+    def pad(self, sequence: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Pad the given sequence to be a multiple of window_size.
+
+        If sequence is None, return None.
+        For 2D sequence (batch_size, seq_len), pad with padding_token.
+        For 3D sequence (batch_size, seq_len, embedding_size), pad with padding_embed.
+
+        Returns:
+            torch.Tensor: Padded sequence with length divisible by window_size.
+        """
+        return self._pad(sequence=sequence, token_type=SequenceWindowUtilsBase.TOKEN_TYPE_PADDING)
 
 @auto_docstring(
     custom_intro="Language encoder model based on GPT-2 for encoding text into latent representations.",
@@ -314,7 +359,6 @@ class LanguageEncoder(LanguageEncoderBase):
         self.ae_utils = LanguageEncoderUtils(
             window_size = config.window_size,
             padding_token = config.pad_token_id,
-            # padding_token = self.config.eos_token_id,
             padding_embed = None,
             wte=self.wte,
         )
@@ -355,11 +399,11 @@ class LanguageEncoder(LanguageEncoderBase):
         """
         if outputs is None:
             return outputs
-        # Only keep the last hidden_state of hidden_state of the last layer
-        logits_to_keep: int = 1
-        slice_indices = slice(-logits_to_keep, None, None)
         return BaseAutoencoderOutputWithPastAndCrossAttentions(
-            last_tail_hidden_state=self.ae_utils.split_sequence(sequence=outputs.last_hidden_state[:, slice_indices, :]),
+            # Only keep the last hidden_state of hidden_state of the last layer
+            last_tail_hidden_state=self.ae_utils.split_sequence(sequence=outputs.last_hidden_state[:, -1:, ...]),
+            # Only keep the last self.config.window_size hidden_state of hidden_state of the last layer
+            last_window_hidden_state=self.ae_utils.split_sequence(sequence=outputs.last_hidden_state[:, -self.config.window_size:, ...]),
             last_hidden_state=self.ae_utils.split_sequence(sequence=outputs.last_hidden_state),
             past_key_values=outputs.past_key_values,
             hidden_states=tuple(self.ae_utils.split_sequence(sequence=hidden_state) for hidden_state in outputs.hidden_states) if outputs.hidden_states is not None else None,
@@ -548,6 +592,7 @@ class LanguageEncoderLatentHead(GPT2PreTrainedModel, GenerationMixin):
 
         return CausalLMAutoencoderOutputWithCrossAttentions(
             last_tail_hidden_state=transformer_outputs.last_tail_hidden_state,
+            last_window_hidden_state=transformer_outputs.last_window_hidden_state,
             last_hidden_state=transformer_outputs.last_hidden_state,
             loss=loss,
             logits=logits,
@@ -567,9 +612,11 @@ class LanguageDecoder(LanguageDecoderBase):
     def __init__(self, config: LatentGPT2Config):
         super().__init__(config)
         self.ae_utils = LanguageDecoderUtils(
-            window_size = config.window_size,
+            window_size=config.window_size,
+            padding_token=config.pad_token_id,
+            masking_token=getattr(config, "mask_token_id", config.pad_token_id),
+            wte=self.wte,
         )
-        # self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -626,7 +673,10 @@ class LanguageDecoder(LanguageDecoderBase):
             return outputs
         # The input last_hidden_state have already the last hidden_states of the last layer, no need to slice
         return BaseAutoencoderOutputWithPastAndCrossAttentions(
-            last_tail_hidden_state=self.ae_utils.split_sequence(sequence=outputs.last_hidden_state),
+            # Only keep the last hidden_state of hidden_state of the last layer
+            last_tail_hidden_state=self.ae_utils.split_sequence(sequence=outputs.last_hidden_state[:, -1:, ...]),
+            # Only keep the last self.config.window_size hidden_state of hidden_state of the last layer
+            last_window_hidden_state=self.ae_utils.split_sequence(sequence=outputs.last_hidden_state[:, -self.config.window_size:, ...]),
             last_hidden_state=self.ae_utils.split_sequence(sequence=outputs.last_hidden_state),
             past_key_values=outputs.past_key_values,
             hidden_states=tuple(self.ae_utils.split_sequence(sequence=hidden_state) for hidden_state in outputs.hidden_states) if outputs.hidden_states is not None else None,
@@ -832,6 +882,7 @@ class LanguageDecoderLMHead(GPT2PreTrainedModel, GenerationMixin):
 
         return CausalLMAutoencoderOutputWithCrossAttentions(
             last_tail_hidden_state=transformer_outputs.last_tail_hidden_state,
+            last_window_hidden_state=transformer_outputs.last_window_hidden_state,
             last_hidden_state=transformer_outputs.last_hidden_state,
             loss=loss,
             logits=logits,
@@ -990,7 +1041,7 @@ class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
             # cache_position=cache_position,
             # token_type_ids=token_type_ids,
             # position_ids=position_ids,
-            # inputs_embeds=inputs_embeds,
+            inputs_embeds=inputs_embeds,
             # encoder_hidden_states=encoder_hidden_states,
             # encoder_attention_mask=encoder_attention_mask,
             past_key_values=None,
@@ -998,7 +1049,6 @@ class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
             cache_position=None,
             token_type_ids=None,
             position_ids=None,
-            inputs_embeds=None,
             encoder_hidden_states=None,
             encoder_attention_mask=None,
             use_cache=use_cache,
@@ -1009,8 +1059,8 @@ class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
         # hidden_states = encoder_output[0]
         decoder_output = self.decoder(
             input_ids=None,
-            inputs_latents=None,
-            # inputs_latents=encoder_output.latents,
+            # inputs_latents=None,
+            inputs_latents=encoder_output.latents,
             # past_key_values=past_key_values,
             # attention_mask=attention_mask,
             # cache_position=cache_position,
@@ -1021,8 +1071,8 @@ class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
             cache_position=None,
             token_type_ids=None,
             position_ids=None,
-            inputs_embeds=encoder_output.latent_embeds,
-            # inputs_embeds=None,
+            # inputs_embeds=encoder_output.latent_embeds,
+            inputs_embeds=None,
             # encoder_hidden_states=encoder_hidden_states,
             # encoder_attention_mask=encoder_attention_mask,
             encoder_hidden_states=None,
@@ -1039,10 +1089,12 @@ class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
 
         loss = None
         if labels is not None:
+            # Pad labels to make it can be divided by self.config.window_size
+            padded_labels: torch.LongTensor = self.decoder.transformer.ae_utils.pad(sequence=labels)
             # Flatten the tokens
             loss = self.loss_function(
                 logits=logits,
-                labels=labels,
+                labels=padded_labels,
                 vocab_size=self.config.vocab_size,
                 **kwargs,
             )
@@ -1053,6 +1105,7 @@ class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
 
         ae_output = CausalLMAutoencoderOutputWithCrossAttentions(
             last_tail_hidden_state=decoder_output.last_tail_hidden_state,
+            last_window_hidden_state=decoder_output.last_window_hidden_state,
             last_hidden_state=decoder_output.last_hidden_state,
             loss=loss,
             logits=logits,
@@ -1086,14 +1139,15 @@ class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
             logits = logits[..., :-shift_labels, :].contiguous()
             labels = labels[..., shift_labels:].contiguous()
 
-        # TODO: Claude Code update, double check, Ensure logits and labels have the same sequence length
-        logits_seq_len = logits.size(-2)
-        labels_seq_len = labels.size(-1)
-        if logits_seq_len != labels_seq_len:
-            min_len = min(logits_seq_len, labels_seq_len)
-            logits = logits[..., :min_len, :].contiguous()
-            labels = labels[..., :min_len].contiguous()
-        # TODO: Claude Code update ends
+        # Claude Code update, double check, Ensure logits and labels have the same sequence length
+        # I've added a padding function for labels, making logits and labels have the same length. Labels sometimes cannot be devided by the self.config.window_size
+        # logits_seq_len = logits.size(-2)
+        # labels_seq_len = labels.size(-1)
+        # if logits_seq_len != labels_seq_len:
+        #     min_len = min(logits_seq_len, labels_seq_len)
+        #     logits = logits[..., :min_len, :].contiguous()
+        #     labels = labels[..., :min_len].contiguous()
+        # Claude Code update ends
 
         log_probs = -nn.functional.log_softmax(logits, dim=-1)
         if labels.dim() == log_probs.dim() - 1:

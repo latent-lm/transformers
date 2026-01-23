@@ -7,14 +7,21 @@ from ...generation import GenerationMixin
 from ...modeling_outputs import LatentCausalLMOutputWithCrossAttentions
 from .configuration_latent_gpt2 import LatentGPT2Config
 from .modeling_autoencoder import LanguageAutoencoder, GPT2PreTrainedModel
-from .modeling_flow_matching import LanguageFlowMatching
+from .modeling_diffusion_autoencoder import LanguageDiffusionAutoencoder
+# from .modeling_flow_matching import LanguageFlowMatching
 
 
 class LatnetAutoregressive(GPT2PreTrainedModel, GenerationMixin):
     def __init__(self, config: LatentGPT2Config):
         super().__init__(config)
-        self.autoencoder: LanguageAutoencoder = LanguageAutoencoder(config=config)
-        # self.fm: LanguageFlowMatching = LanguageFlowMatching(config=config)
+        if config.autoencoder_type == LatentGPT2Config.AUTOENCODER_TYPE_DIFFUSION:
+            self.autoencoder: LanguageDiffusionAutoencoder = LanguageDiffusionAutoencoder(config=config)
+        elif config.autoencoder_type == LatentGPT2Config.AUTOENCODER_TYPE_MULTI_HEAD:
+            self.autoencoder: LanguageAutoencoder = LanguageAutoencoder(config=config)
+        else:
+            raise ValueError(f"Unknown autoencoder type: {config.autoencoder_type}")
+            
+        # self.fm: FlowMatchingModel = FlowMatchingModel(config=config)
         self.fm = None
 
         # Initialize weights and apply final processing
