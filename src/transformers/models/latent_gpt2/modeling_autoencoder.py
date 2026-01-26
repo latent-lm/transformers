@@ -17,35 +17,22 @@
 
 import copy
 import math
-# from collections.abc import Callable
+import warnings
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
 import torch
 from torch import nn
-# from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
-# from ... import initialization as init
-# from ...activations import ACT2FN, get_activation
 from ...cache_utils import Cache, DynamicCache, EncoderDecoderCache
 from ...generation import GenerationMixin
-# from ...masking_utils import create_causal_mask
-# from ...modeling_attn_mask_utils import _prepare_4d_attention_mask_for_sdpa
-# from ...modeling_layers import GradientCheckpointingLayer
 from ...modeling_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
     PreprocessOutput,
     BaseAutoencoderOutputWithPastAndCrossAttentions,
-    # CausalLMOutputWithCrossAttentions,
-    # QuestionAnsweringModelOutput,
-    # SequenceClassifierOutputWithPast,
-    # TokenClassifierOutput,
     CausalLMAutoencoderOutputWithCrossAttentions,
 )
-# from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
-# from ...pytorch_utils import Conv1D
 from ...utils import (
-    # ModelOutput,
     auto_docstring,
     logging,
 )
@@ -191,7 +178,7 @@ class SequenceWindowUtilsBase:
         else:
             raise ValueError(f"token_type, {token_type}, isn't supported, only support {SequenceWindowUtilsBase.SUPPORTED_TOKEN_TYPES}")
 
-    def _pad(self, sequence: Optional[torch.Tensor] = None, token_type: str = "padding") -> torch.Tensor:
+    def pad(self, sequence: Optional[torch.Tensor] = None, token_type: str = "padding") -> torch.Tensor:
         """
         Pad the given sequence to be a multiple of window_size.
 
@@ -226,7 +213,48 @@ class SequenceWindowUtilsBase:
         if sequence is None:
             return sequence
         return sequence.reshape(self._batch_size, self._segment_num * sequence.shape[1], *sequence.shape[2:])
-
+    
+    def split_context_target(
+        self,
+        sequence: torch.Tensor,
+        is_padding: bool = True,
+    ) -> Tuple[torch.Tensor]:
+        if sequence is None:
+            return None
+        if sequence.dim() == 2:
+            context: torch.Tensor = sequence[..., :-self._window_size].contiguous()
+            target: torch.Tensor = sequence[..., -self._window_size:].contiguous()
+            if is_padding:
+                context: torch.Tensor = self.pad(sequence=context)
+        elif sequence.dim() > 2:
+            context: torch.Tensor = sequence[..., :-self._window_size, :].contiguous()
+            target: torch.Tensor = sequence[..., -self._window_size:, :].contiguous()
+            if is_padding:
+                context: torch.Tensor = self.pad(sequence=context)
+        else:
+            raise NotImplementedError(f"Unsupported input dimension: {sequence.dim()} with shape {sequence.shape}")
+        return context, target
+    
+    def split_context_target_then_cat(
+        self,
+        sequence: torch.Tensor,
+        is_padding: bool = True,
+        return_context_target: bool = False,
+    ) -> Tuple[torch.Tensor]:
+        if sequence is None:
+            if return_context_target:
+                return None, None, None
+            return None
+        context, target = self.split_context_target(sequence=sequence, is_padding=is_padding)
+        if sequence.dim() == 2:
+            joint_seq = torch.cat((context, target), dim=-1)
+        elif sequence.dim() > 2:
+            joint_seq = torch.cat((context, target), dim=-2)
+        else:
+            raise NotImplementedError(f"Unsupported input dimension: {sequence.dim()} with shape {sequence.shape}")
+        if return_context_target:
+            return joint_seq, context, target
+        return joint_seq
 
 @auto_docstring(custom_intro="Utility class for language encoding with fixed-size window aggregation.")
 class LanguageEncoderUtils(SequenceWindowUtilsBase):
@@ -246,7 +274,7 @@ class LanguageEncoderUtils(SequenceWindowUtilsBase):
             return sequence
         self._batch_size = sequence.shape[0]
         self._seq_len = sequence.shape[1]
-        padded_sequence = self._pad(sequence=sequence, token_type=SequenceWindowUtilsBase.TOKEN_TYPE_PADDING)
+        padded_sequence = self.pad(sequence=sequence, token_type=SequenceWindowUtilsBase.TOKEN_TYPE_PADDING)
         self._segment_num = padded_sequence.shape[1] // self._window_size
         return padded_sequence.view(self._batch_size * self._segment_num, self._window_size, *padded_sequence.shape[2:])
 
@@ -291,7 +319,7 @@ class LanguageDecoderUtils(SequenceWindowUtilsBase):
             return sequence
         self._batch_size = sequence.shape[0]
         self._seq_len = sequence.shape[1]
-        padded_sequence = self._pad(sequence=sequence, token_type=token_type)
+        padded_sequence = self.pad(sequence=sequence, token_type=token_type)
         self._segment_num = padded_sequence.shape[1] // self._window_size
         return padded_sequence.view(self._batch_size * self._segment_num, self._window_size, *padded_sequence.shape[2:])
 
@@ -347,7 +375,7 @@ class LanguageDecoderUtils(SequenceWindowUtilsBase):
         Returns:
             torch.Tensor: Padded sequence with length divisible by window_size.
         """
-        return self._pad(sequence=sequence, token_type=SequenceWindowUtilsBase.TOKEN_TYPE_PADDING)
+        return super().pad(sequence=sequence, token_type=SequenceWindowUtilsBase.TOKEN_TYPE_PADDING)
 
 @auto_docstring(
     custom_intro="Language encoder model based on GPT-2 for encoding text into latent representations.",
@@ -401,10 +429,10 @@ class LanguageEncoder(LanguageEncoderBase):
             return outputs
         return BaseAutoencoderOutputWithPastAndCrossAttentions(
             # Only keep the last hidden_state of hidden_state of the last layer
-            last_tail_hidden_state=self.ae_utils.split_sequence(sequence=outputs.last_hidden_state[:, -1:, ...]),
+            last_tail_hidden_state=self.ae_utils.split_sequence(sequence=outputs.last_hidden_state[:, -1:, ...]) if outputs.last_hidden_state is not None else None,
             # Only keep the last self.config.window_size hidden_state of hidden_state of the last layer
-            last_window_hidden_state=self.ae_utils.split_sequence(sequence=outputs.last_hidden_state[:, -self.config.window_size:, ...]),
-            last_hidden_state=self.ae_utils.split_sequence(sequence=outputs.last_hidden_state),
+            last_window_hidden_state=self.ae_utils.split_sequence(sequence=outputs.last_hidden_state[:, -self.config.window_size:, ...]) if outputs.last_hidden_state is not None else None,
+            last_hidden_state=self.ae_utils.split_sequence(sequence=outputs.last_hidden_state) if outputs.last_hidden_state is not None else None,
             past_key_values=outputs.past_key_values,
             hidden_states=tuple(self.ae_utils.split_sequence(sequence=hidden_state) for hidden_state in outputs.hidden_states) if outputs.hidden_states is not None else None,
             # TODO: Handle attentions and cross_attentions reshaping
@@ -457,6 +485,8 @@ class LanguageEncoder(LanguageEncoderBase):
         return_segment: bool = True,
         **kwargs,
     ) -> Union[tuple, BaseAutoencoderOutputWithPastAndCrossAttentions]:
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
         pre_process_res: PreprocessOutput = self.pre_process_inputs(input_ids=input_ids, inputs_embeds=inputs_embeds)
         output = super().forward(
             input_ids=pre_process_res.input_ids,
@@ -565,7 +595,7 @@ class LanguageEncoderLatentHead(GPT2PreTrainedModel, GenerationMixin):
             encoder_attention_mask=encoder_attention_mask,
             use_cache=use_cache,
             output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
+            output_hidden_states=True,
             return_dict=True,
         )
         # Only use the last hidden_state of the last layer as latent
@@ -576,28 +606,19 @@ class LanguageEncoderLatentHead(GPT2PreTrainedModel, GenerationMixin):
         logits = self.latent_head(latents[:, slice_indices, :])
 
         loss = None
-        # No loss function provided
-        # if labels is not None:
-        #     # Flatten the tokens
-        #     loss = self.loss_function(
-        #         logits,
-        #         labels,
-        #         vocab_size=self.config.vocab_size,
-        #         **kwargs,
-        #     )
 
         if not return_dict:
             output = (logits,) + transformer_outputs[1:]
             return ((loss,) + output) if loss is not None else output
 
         return CausalLMAutoencoderOutputWithCrossAttentions(
-            last_tail_hidden_state=transformer_outputs.last_tail_hidden_state,
-            last_window_hidden_state=transformer_outputs.last_window_hidden_state,
-            last_hidden_state=transformer_outputs.last_hidden_state,
+            last_tail_hidden_state=transformer_outputs.last_tail_hidden_state if output_hidden_states else None,
+            last_window_hidden_state=transformer_outputs.last_window_hidden_state if output_hidden_states else None,
+            last_hidden_state=transformer_outputs.last_hidden_state if output_hidden_states else None,
             loss=loss,
             logits=logits,
             past_key_values=transformer_outputs.past_key_values,
-            hidden_states=transformer_outputs.hidden_states,
+            hidden_states=transformer_outputs.hidden_states if output_hidden_states else None,
             attentions=transformer_outputs.attentions,
             cross_attentions=transformer_outputs.cross_attentions,
             latent_embeds=transformer_outputs.last_tail_hidden_state,
@@ -674,10 +695,10 @@ class LanguageDecoder(LanguageDecoderBase):
         # The input last_hidden_state have already the last hidden_states of the last layer, no need to slice
         return BaseAutoencoderOutputWithPastAndCrossAttentions(
             # Only keep the last hidden_state of hidden_state of the last layer
-            last_tail_hidden_state=self.ae_utils.split_sequence(sequence=outputs.last_hidden_state[:, -1:, ...]),
+            last_tail_hidden_state=self.ae_utils.split_sequence(sequence=outputs.last_hidden_state[:, -1:, ...]) if outputs.last_hidden_state is not None else None,
             # Only keep the last self.config.window_size hidden_state of hidden_state of the last layer
-            last_window_hidden_state=self.ae_utils.split_sequence(sequence=outputs.last_hidden_state[:, -self.config.window_size:, ...]),
-            last_hidden_state=self.ae_utils.split_sequence(sequence=outputs.last_hidden_state),
+            last_window_hidden_state=self.ae_utils.split_sequence(sequence=outputs.last_hidden_state[:, -self.config.window_size:, ...]) if outputs.last_hidden_state is not None else None,
+            last_hidden_state=self.ae_utils.split_sequence(sequence=outputs.last_hidden_state) if outputs.last_hidden_state is not None else None,
             past_key_values=outputs.past_key_values,
             hidden_states=tuple(self.ae_utils.split_sequence(sequence=hidden_state) for hidden_state in outputs.hidden_states) if outputs.hidden_states is not None else None,
             # TODO: Handle attentions and cross_attentions reshaping
@@ -731,8 +752,10 @@ class LanguageDecoder(LanguageDecoderBase):
         return_segment: bool = True,
         **kwargs,
     ) -> Union[tuple, CausalLMAutoencoderOutputWithCrossAttentions]:
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
         if input_ids is not None:
-            raise Warning("Decoder only processes inputs_latents and inputs_embeds but not input_ids")
+            warnings.warn("Decoder only processes inputs_latents and inputs_embeds but not input_ids")
         pre_process_res: PreprocessOutput = self.pre_process_inputs(input_ids=input_ids, inputs_latents=inputs_latents, inputs_embeds=inputs_embeds)
         output = super().forward(
             input_ids=None,
@@ -856,7 +879,7 @@ class LanguageDecoderLMHead(GPT2PreTrainedModel, GenerationMixin):
             encoder_attention_mask=encoder_attention_mask,
             use_cache=use_cache,
             output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
+            output_hidden_states=True,
             return_dict=True,
         )
         latents = transformer_outputs.last_tail_hidden_state
@@ -866,28 +889,19 @@ class LanguageDecoderLMHead(GPT2PreTrainedModel, GenerationMixin):
         logits = self._project_with_multi_heads(latents[:, slice_indices, :])
 
         loss = None
-        # No loss function provided
-        # if labels is not None:
-        #     # Flatten the tokens
-        #     loss = self.loss_function(
-        #         logits,
-        #         labels,
-        #         vocab_size=self.config.vocab_size,
-        #         **kwargs,
-        #     )
 
         if not return_dict:
             output = (logits,) + transformer_outputs[1:]
             return ((loss,) + output) if loss is not None else output
 
         return CausalLMAutoencoderOutputWithCrossAttentions(
-            last_tail_hidden_state=transformer_outputs.last_tail_hidden_state,
-            last_window_hidden_state=transformer_outputs.last_window_hidden_state,
-            last_hidden_state=transformer_outputs.last_hidden_state,
+            last_tail_hidden_state=transformer_outputs.last_tail_hidden_state if output_hidden_states else None,
+            last_window_hidden_state=transformer_outputs.last_window_hidden_state if output_hidden_states else None,
+            last_hidden_state=transformer_outputs.last_hidden_state if output_hidden_states else None,
             loss=loss,
             logits=logits,
             past_key_values=transformer_outputs.past_key_values,
-            hidden_states=transformer_outputs.hidden_states,
+            hidden_states=transformer_outputs.hidden_states if output_hidden_states else None,
             attentions=transformer_outputs.attentions,
             cross_attentions=transformer_outputs.cross_attentions,
             latent_embeds=inferred_inputs_embeds,
@@ -943,25 +957,20 @@ class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
         encoder_output = self.encoder(
             input_ids=input_ids,
             past_key_values=past_key_values,
-            attention_mask=attention_mask,
             cache_position=cache_position,
+            attention_mask=attention_mask,
             token_type_ids=token_type_ids,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
             encoder_hidden_states=encoder_hidden_states,
             encoder_attention_mask=encoder_attention_mask,
-            # past_key_values=None,
-            # attention_mask=None,
-            # cache_position=None,
-            # token_type_ids=None,
-            # position_ids=None,
-            # inputs_embeds=None,
-            # encoder_hidden_states=None,
-            # encoder_attention_mask=None,
+            labels=labels,
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            logits_to_keep=logits_to_keep,
+            **kwargs,
         )
         return encoder_output
     
@@ -992,25 +1001,40 @@ class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
             inputs_latents=inputs_latents,
             past_key_values=past_key_values,
             attention_mask=attention_mask,
-            cache_position=cache_position,
             token_type_ids=token_type_ids,
+            cache_position=cache_position,
             position_ids=position_ids,
-            # past_key_values=None,
-            # attention_mask=None,
-            # cache_position=None,
-            # token_type_ids=None,
-            # position_ids=None,
-            inputs_embeds=encoder_output.last_tail_hidden_state,
+            inputs_embeds=inputs_embeds,
             encoder_hidden_states=encoder_hidden_states,
             encoder_attention_mask=encoder_attention_mask,
-            # encoder_hidden_states=None,
-            # encoder_attention_mask=None,
+            labels=labels,
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            return_dict=True,
+            return_dict=return_dict,
+            logits_to_keep=logits_to_keep,
+            **kwargs,
         )
         return decoder_output
+
+    def _format_dict_output(
+        self,
+        dict_output,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+    ) -> CausalLMAutoencoderOutputWithCrossAttentions:
+        return CausalLMAutoencoderOutputWithCrossAttentions(
+            last_tail_hidden_state=dict_output.last_tail_hidden_state if output_hidden_states else None,
+            last_window_hidden_state=dict_output.last_window_hidden_state if output_hidden_states else None,
+            last_hidden_state=dict_output.last_hidden_state if output_hidden_states else None,
+            loss=dict_output.loss,
+            logits=dict_output.logits,
+            past_key_values=dict_output.past_key_values,
+            hidden_states=dict_output.hidden_states if output_hidden_states else None,
+            attentions=dict_output.attentions if output_attentions else None,
+            cross_attentions=dict_output.cross_attentions if output_attentions else None,
+            latents=dict_output.last_tail_hidden_state,
+        )
 
     def forward(
         self,
@@ -1034,16 +1058,9 @@ class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
     ) -> Union[tuple, CausalLMAutoencoderOutputWithCrossAttentions]:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        encoder_output = self.encoder(
+        encoder_output = self.encode(
             input_ids=input_ids,
-            # past_key_values=past_key_values,
-            # attention_mask=attention_mask,
-            # cache_position=cache_position,
-            # token_type_ids=token_type_ids,
-            # position_ids=position_ids,
             inputs_embeds=inputs_embeds,
-            # encoder_hidden_states=encoder_hidden_states,
-            # encoder_attention_mask=encoder_attention_mask,
             past_key_values=None,
             attention_mask=None,
             cache_position=None,
@@ -1055,37 +1072,31 @@ class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
             output_attentions=output_attentions,
             output_hidden_states=True,
             return_dict=True,
+            logits_to_keep=0,
         )
         # hidden_states = encoder_output[0]
-        decoder_output = self.decoder(
+        decoder_output = self.decode(
             input_ids=None,
-            # inputs_latents=None,
             inputs_latents=encoder_output.latents,
-            # past_key_values=past_key_values,
-            # attention_mask=attention_mask,
-            # cache_position=cache_position,
-            # token_type_ids=token_type_ids,
-            # position_ids=position_ids,
             past_key_values=None,
             attention_mask=None,
             cache_position=None,
             token_type_ids=None,
             position_ids=None,
-            # inputs_embeds=encoder_output.latent_embeds,
             inputs_embeds=None,
-            # encoder_hidden_states=encoder_hidden_states,
-            # encoder_attention_mask=encoder_attention_mask,
             encoder_hidden_states=None,
             encoder_attention_mask=None,
             use_cache=use_cache,
             output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
+            output_hidden_states=True,
             return_dict=True,
+            logits_to_keep=0,
         )
 
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        # logits = self.lm_head(decoder_output.hidden_states[:, slice_indices, :])
         logits = decoder_output.logits[:, slice_indices, :]
+        # print(f"decoder_output.logits: {decoder_output.logits.shape}")
+        # print(f"logits: {logits.shape}")
 
         loss = None
         if labels is not None:
@@ -1104,17 +1115,20 @@ class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
             return ((loss,) + output) if loss is not None else output
 
         ae_output = CausalLMAutoencoderOutputWithCrossAttentions(
-            last_tail_hidden_state=decoder_output.last_tail_hidden_state,
-            last_window_hidden_state=decoder_output.last_window_hidden_state,
-            last_hidden_state=decoder_output.last_hidden_state,
+            last_tail_hidden_state=decoder_output.last_tail_hidden_state if output_hidden_states else None,
+            last_window_hidden_state=decoder_output.last_window_hidden_state if output_hidden_states else None,
+            last_hidden_state=decoder_output.last_hidden_state if output_hidden_states else None,
             loss=loss,
             logits=logits,
             past_key_values=decoder_output.past_key_values,
-            hidden_states=decoder_output.hidden_states,
-            attentions=decoder_output.attentions,
-            cross_attentions=decoder_output.cross_attentions,
+            hidden_states=decoder_output.hidden_states if output_hidden_states else None,
+            attentions=decoder_output.attentions if output_attentions else None,
+            cross_attentions=decoder_output.cross_attentions if output_attentions else None,
             latents=encoder_output.last_tail_hidden_state,
         )
+        # Handle encoder and decoder dict output format
+        encoder_output = self._format_dict_output(dict_output=encoder_output, output_attentions=output_attentions, output_hidden_states=output_hidden_states)
+        decoder_output = self._format_dict_output(dict_output=decoder_output, output_attentions=output_attentions, output_hidden_states=output_hidden_states)
         
         # When return_encoder_decoder_res=True, return tuple of (ar_outputs, ltar_output, encoder_output)
         if return_encoder_decoder_res:
@@ -1157,6 +1171,7 @@ class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
         # In case the ignore_index is -100, the gather will fail, so we replace labels by 0. The padding_mask
         # will ignore them in any case.
         labels = torch.clamp(labels, min=0)
+        # print(f"log_probs: {log_probs.shape}, labels: {labels.shape}")
         nll_loss = log_probs.gather(dim=-1, index=labels)
         # works for fp16 input tensor too, by internally upcasting it to fp32
         smoothed_loss = log_probs.sum(dim=-1, keepdim=True, dtype=torch.float32)

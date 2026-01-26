@@ -578,7 +578,7 @@ class LanguageDiffusionDecoderLMHead(GPT2PreTrainedModel, GenerationMixin):
             encoder_attention_mask=encoder_attention_mask,
             use_cache=use_cache,
             output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
+            output_hidden_states=True,
             return_dict=True,
         )
         last_window_hidden_state = transformer_outputs.last_window_hidden_state
@@ -602,15 +602,15 @@ class LanguageDiffusionDecoderLMHead(GPT2PreTrainedModel, GenerationMixin):
             return ((loss,) + output) if loss is not None else output
 
         return CausalLMAutoencoderOutputWithCrossAttentions(
-            last_tail_hidden_state=transformer_outputs.last_tail_hidden_state,
-            last_window_hidden_state=transformer_outputs.last_window_hidden_state,
-            last_hidden_state=transformer_outputs.last_hidden_state,
+            last_tail_hidden_state=transformer_outputs.last_tail_hidden_state if output_hidden_states else None,
+            last_window_hidden_state=transformer_outputs.last_window_hidden_state if output_hidden_states else None,
+            last_hidden_state=transformer_outputs.last_hidden_state if output_hidden_states else None,
             loss=loss,
             logits=logits,
             past_key_values=transformer_outputs.past_key_values,
-            hidden_states=transformer_outputs.hidden_states,
-            attentions=transformer_outputs.attentions,
-            cross_attentions=transformer_outputs.cross_attentions,
+            hidden_states=transformer_outputs.hidden_states if output_hidden_states else None,
+            attentions=transformer_outputs.attentions if output_attentions else None,
+            cross_attentions=transformer_outputs.cross_attentions if output_attentions else None,
             latent_embeds=inferred_inputs_embeds,
             latents=inputs_latents,
         )
@@ -886,25 +886,20 @@ class LanguageDiffusionAutoencoder(GPT2PreTrainedModel, GenerationMixin):
         encoder_output = self.encoder(
             input_ids=input_ids,
             past_key_values=past_key_values,
-            attention_mask=attention_mask,
             cache_position=cache_position,
+            attention_mask=attention_mask,
             token_type_ids=token_type_ids,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
             encoder_hidden_states=encoder_hidden_states,
             encoder_attention_mask=encoder_attention_mask,
-            # past_key_values=None,
-            # attention_mask=None,
-            # cache_position=None,
-            # token_type_ids=None,
-            # position_ids=None,
-            # inputs_embeds=None,
-            # encoder_hidden_states=None,
-            # encoder_attention_mask=None,
+            labels=labels,
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            logits_to_keep=logits_to_keep,
+            **kwargs,
         )
         return encoder_output
 
@@ -974,26 +969,41 @@ class LanguageDiffusionAutoencoder(GPT2PreTrainedModel, GenerationMixin):
             input_ids=input_ids,
             inputs_latents=inputs_latents,
             past_key_values=past_key_values,
-            attention_mask=attention_mask,
             cache_position=cache_position,
+            attention_mask=attention_mask,
             token_type_ids=token_type_ids,
             position_ids=position_ids,
-            # past_key_values=None,
-            # attention_mask=None,
-            # cache_position=None,
-            # token_type_ids=None,
-            # position_ids=None,
-            inputs_embeds=encoder_output.last_tail_hidden_state,
+            inputs_embeds=inputs_embeds,
             encoder_hidden_states=encoder_hidden_states,
             encoder_attention_mask=encoder_attention_mask,
-            # encoder_hidden_states=None,
-            # encoder_attention_mask=None,
+            labels=labels,
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            return_dict=True,
+            return_dict=return_dict,
+            logits_to_keep=logits_to_keep,
+            **kwargs,
         )
         return decoder_output
+    
+    def _format_dict_output(
+        self,
+        dict_output,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+    ) -> CausalLMAutoencoderOutputWithCrossAttentions:
+        return CausalLMAutoencoderOutputWithCrossAttentions(
+            last_tail_hidden_state=dict_output.last_tail_hidden_state if output_hidden_states else None,
+            last_window_hidden_state=dict_output.last_window_hidden_state if output_hidden_states else None,
+            last_hidden_state=dict_output.last_hidden_state if output_hidden_states else None,
+            loss=dict_output.loss,
+            logits=dict_output.logits,
+            past_key_values=dict_output.past_key_values,
+            hidden_states=dict_output.hidden_states if output_hidden_states else None,
+            attentions=dict_output.attentions if output_attentions else None,
+            cross_attentions=dict_output.cross_attentions if output_attentions else None,
+            latents=dict_output.last_tail_hidden_state,
+        )
 
     @auto_docstring
     def forward(
@@ -1070,54 +1080,39 @@ class LanguageDiffusionAutoencoder(GPT2PreTrainedModel, GenerationMixin):
 
         encoder_output = self.encoder(
             input_ids=input_ids,
-            # past_key_values=past_key_values,
-            # attention_mask=attention_mask,
-            # cache_position=cache_position,
-            # token_type_ids=token_type_ids,
-            # position_ids=position_ids,
-            # inputs_embeds=inputs_embeds,
-            # encoder_hidden_states=encoder_hidden_states,
-            # encoder_attention_mask=encoder_attention_mask,
             past_key_values=None,
             attention_mask=None,
             cache_position=None,
             token_type_ids=None,
             position_ids=None,
             inputs_embeds=None,
-            encoder_hidden_states=None,
-            encoder_attention_mask=None,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=True,
-            return_dict=True,
-        )
-        # print(f"labels: {labels.shape}")
-        encoder_input_ids = self._get_decoder_inputs(labels=labels)
-        # print(f"encoder_input_ids: {encoder_input_ids.shape}")
-        decoder_output = self.decoder(
-            input_ids=encoder_input_ids,
-            # inputs_latents=None,
-            inputs_latents=encoder_output.latents,
-            # past_key_values=past_key_values,
-            # attention_mask=attention_mask,
-            # cache_position=cache_position,
-            # token_type_ids=token_type_ids,
-            # position_ids=position_ids,
-            past_key_values=None,
-            attention_mask=None,
-            cache_position=None,
-            token_type_ids=None,
-            position_ids=None,
-            # inputs_embeds=encoder_output.latent_embeds,
-            inputs_embeds=None,
-            # encoder_hidden_states=encoder_hidden_states,
-            # encoder_attention_mask=encoder_attention_mask,
             encoder_hidden_states=None,
             encoder_attention_mask=None,
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=True,
+            logits_to_keep=0,
+        )
+
+        encoder_input_ids = self._get_decoder_inputs(labels=labels)
+
+        decoder_output = self.decoder(
+            input_ids=encoder_input_ids,
+            inputs_latents=encoder_output.latents,
+            past_key_values=None,
+            attention_mask=None,
+            cache_position=None,
+            token_type_ids=None,
+            position_ids=None,
+            inputs_embeds=None,
+            encoder_hidden_states=None,
+            encoder_attention_mask=None,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=True,
+            logits_to_keep=0,
         )
 
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
@@ -1142,17 +1137,21 @@ class LanguageDiffusionAutoencoder(GPT2PreTrainedModel, GenerationMixin):
             return ((loss,) + output) if loss is not None else output
 
         ae_output = CausalLMAutoencoderOutputWithCrossAttentions(
-            last_tail_hidden_state=decoder_output.last_tail_hidden_state,
-            last_window_hidden_state=decoder_output.last_window_hidden_state,
-            last_hidden_state=decoder_output.last_hidden_state,
+            last_tail_hidden_state=decoder_output.last_tail_hidden_state if output_hidden_states else None,
+            last_window_hidden_state=decoder_output.last_window_hidden_state if output_hidden_states else None,
+            last_hidden_state=decoder_output.last_hidden_state if output_hidden_states else None,
             loss=loss,
             logits=logits,
             past_key_values=decoder_output.past_key_values,
-            hidden_states=decoder_output.hidden_states,
-            attentions=decoder_output.attentions,
-            cross_attentions=decoder_output.cross_attentions,
-            latents=encoder_output.last_tail_hidden_state,
+            hidden_states=decoder_output.hidden_states if output_hidden_states else None,
+            attentions=decoder_output.attentions if output_attentions else None,
+            cross_attentions=decoder_output.cross_attentions if output_attentions else None,
+            latents=encoder_output.latents,
         )
+        
+        # Handle encoder and decoder dict output format
+        encoder_output = self._format_dict_output(dict_output=encoder_output, output_attentions=output_attentions, output_hidden_states=output_hidden_states)
+        decoder_output = self._format_dict_output(dict_output=decoder_output, output_attentions=output_attentions, output_hidden_states=output_hidden_states)
 
         # When return_encoder_decoder_res=True, return tuple of (ar_outputs, ltar_output, encoder_output)
         if return_encoder_decoder_res:
@@ -1218,15 +1217,13 @@ class LanguageDiffusionAutoencoder(GPT2PreTrainedModel, GenerationMixin):
             logits = logits[..., :-shift_labels, :].contiguous()
             labels = labels[..., shift_labels:].contiguous()
 
-        # Claude Code update, double check, Ensure logits and labels have the same sequence length
-        # I've added a padding function for labels, making logits and labels have the same length. Labels sometimes cannot be devided by the self.config.window_size
+        # Ensure logits and labels have the same sequence length
         # logits_seq_len = logits.size(-2)
         # labels_seq_len = labels.size(-1)
         # if logits_seq_len != labels_seq_len:
         #     min_len = min(logits_seq_len, labels_seq_len)
         #     logits = logits[..., :min_len, :].contiguous()
         #     labels = labels[..., :min_len].contiguous()
-        # Claude Code update ends
 
         log_probs = -nn.functional.log_softmax(logits, dim=-1)
         if labels.dim() == log_probs.dim() - 1:
