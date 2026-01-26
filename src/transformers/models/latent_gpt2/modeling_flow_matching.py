@@ -402,7 +402,8 @@ class LanguageFlowMatchingBase(GPT2ModelBase):
         # Word Position Encoding
         self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
         # FLow Matching TimeStep Encoding
-        self.tse = nn.Embedding(1, self.embed_dim)
+        # self.tse = nn.Embedding(1, self.embed_dim)
+        self.tse = nn.Linear(1, self.embed_dim, bias=False)
 
         self.drop = nn.Dropout(config.embd_pdrop)
         self.h = nn.ModuleList([GPT2Block(config, layer_idx=i) for i in range(config.num_hidden_layers_fm)])
@@ -427,7 +428,7 @@ class LanguageFlowMatchingBase(GPT2ModelBase):
         self.wte = copy.deepcopy(pretrained_model.wte)
         self.wpe = copy.deepcopy(pretrained_model.wpe)
         self.drop = copy.deepcopy(pretrained_model.drop)
-        self.h = copy.deepcopy(pretrained_model.h[self.config.num_hidden_layers_encoder:self.config.num_hidden_layers_encoder + self.config.num_hidden_layers_fm])
+        self.h = copy.deepcopy(pretrained_model.h[0:self.config.num_hidden_layers_fm])
         self.ln_f = copy.deepcopy(pretrained_model.ln_f)
         self.gradient_checkpointing = pretrained_model.gradient_checkpointing
 
@@ -604,6 +605,7 @@ class LanguageFlowMatching(GPT2PreTrainedModel, GenerationMixin):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        return_trajectories: Optional[bool] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs,
     ) -> Union[tuple, CausalLMFlowMatchingOutputWithCrossAttentions]:
@@ -632,15 +634,13 @@ class LanguageFlowMatching(GPT2PreTrainedModel, GenerationMixin):
             are ignored (masked), the loss is only computed for labels in `[0, ..., config.vocab_size]`
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        
-        print(f"labels: {labels.shape}")
+
         inputs_prev_latent, inputs_latent_timestep, velocity = self._get_inputs_outputs(
             inputs_prev_latent=inputs_prev_latent,
             inputs_latent_timestep=inputs_latent_timestep,
             inputs_embeds=inputs_embeds,
             labels=labels,
         )
-        print(f"inputs_prev_latent: {inputs_prev_latent.shape}, inputs_latent_timestep: {inputs_latent_timestep.shape}")
 
         transformer_outputs = self.transformer(
             inputs_prev_latent=inputs_prev_latent,
@@ -656,11 +656,14 @@ class LanguageFlowMatching(GPT2PreTrainedModel, GenerationMixin):
             encoder_attention_mask=encoder_attention_mask,
             use_cache=use_cache,
             output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
+            output_hidden_states=True,  # Required for accessing hidden_states
             return_dict=True,
         )
-        logits = transformer_outputs.last_hidden_state[:, -1, ...]
-        latents = (s[:, -1, ...] for s in transformer_outputs.hidden_states)
+
+        logits = transformer_outputs.last_hidden_state[:, -1:, ...]
+        if return_trajectories:
+            trajectories = logits.unsqueeze(1)
+        estimates = inputs_prev_latent - (inputs_latent_timestep - 1.0) * logits
         # last_context = transformer_outputs.last_hidden_state[:, :-1, ...]
         # contexts = (s[:, :-1, ...] for s in transformer_outputs.hidden_states)
 
@@ -683,15 +686,15 @@ class LanguageFlowMatching(GPT2PreTrainedModel, GenerationMixin):
             return ((loss,) + output) if loss is not None else output
 
         return CausalLMFlowMatchingOutputWithCrossAttentions(
-            last_hidden_state=transformer_outputs.last_hidden_state,
+            last_hidden_state=transformer_outputs.last_hidden_state if output_hidden_states else None,
             loss=loss,
             logits=logits,
             past_key_values=transformer_outputs.past_key_values,
-            hidden_states=transformer_outputs.hidden_states,
-            attentions=transformer_outputs.attentions,
-            cross_attentions=transformer_outputs.cross_attentions,
-            last_latent=logits,
-            latents=latents,
+            hidden_states=transformer_outputs.hidden_states if output_hidden_states else None,
+            attentions=transformer_outputs.attentions if output_attentions else None,
+            cross_attentions=transformer_outputs.cross_attentions if output_attentions else None,
+            estimates=estimates,
+            trajectories=trajectories if return_trajectories else None,
         )
         
     def _loss_function(
@@ -718,7 +721,7 @@ class LanguageFlowMatching(GPT2PreTrainedModel, GenerationMixin):
             # Training mode
             if inputs_latent_timestep is None and inputs_prev_latent is None:
                 # If both inputs_latent_timestep and inputs_prev_latent are not provided, random sample
-                inputs_latent_timestep = torch.rand(labels.shape[0], device=labels.device)
+                inputs_latent_timestep = torch.rand(labels.shape[0], 1, device=labels.device)
                 noise = self.transformer._rand_latent(batch_size=labels.shape[0], device=labels.device)
                 # Expand timestep for broadcasting: (batch_size,) -> (batch_size, 1, 1) for (batch_size, seq_len, hidden_dim)
                 t_expanded = inputs_latent_timestep.view(-1, 1, 1)

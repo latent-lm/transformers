@@ -945,10 +945,10 @@ class CausalLMFlowMatchingOutputWithCrossAttentions(ModelOutput):
 
             Contains pre-computed hidden-states (key and values in the attention blocks) that can be used (see
             `past_key_values` input) to speed up sequential decoding.
-        last_latents (`torch.FloatTensor` of shape `(batch_size, 1, config.hidden_size)`):
-            The last latent of flow matching model output.
-        latents (`torch.FloatTensor` of shape `(batch_size, sampling_steps, 1, config.hidden_size)`):
-            The latent history of flow matching model output.
+        estimates (`torch.FloatTensor` of shape `(batch_size, 1, config.hidden_size)`):
+            The estimation for the final sample of flow matching model.
+        trajectories (`tuple[torch.FloatTensor]` of shape `(batch_size, 1, config.hidden_size)` with length trajectory length):
+            The trajectory of flow matching model output.
     """
 
     last_hidden_state: Optional[torch.FloatTensor] = None
@@ -958,8 +958,8 @@ class CausalLMFlowMatchingOutputWithCrossAttentions(ModelOutput):
     hidden_states: Optional[tuple[torch.FloatTensor, ...]] = None
     attentions: Optional[tuple[torch.FloatTensor, ...]] = None
     cross_attentions: Optional[tuple[torch.FloatTensor, ...]] = None
-    last_latent: Optional[torch.FloatTensor] = None
-    latents: Optional[tuple[torch.FloatTensor, ...]] = None
+    estimates: Optional[torch.FloatTensor] = None
+    trajectories: Optional[tuple[torch.FloatTensor, ...]] = None
     
 @dataclass
 class CausalLMFlowMatchingSamplingOutputWithCrossAttentions(ModelOutput):

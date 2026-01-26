@@ -148,7 +148,7 @@ class LatentGPT2Config(GPT2Config):
         autoencoder_type: str = "multi_head",
         num_hidden_layers_encoder: int = 6,
         num_hidden_layers_decoder: int = 6,
-        num_hidden_layers_fm: int = 10,
+        num_hidden_layers_fm: int = 12,
         pad_token_id: int = 50256,
         mask_token_id: int = 50256,
         # Diffusion Autoencoder paramters
@@ -189,7 +189,7 @@ class LatentGPT2Config(GPT2Config):
         autoencoder_type: str = "multi_head",
         num_hidden_layers_encoder: int = 6,
         num_hidden_layers_decoder: int = 6,
-        num_hidden_layers_fm: int = 10,
+        num_hidden_layers_fm: int = 12,
         pad_token_id: Optional[int] = None,
         mask_token_id: Optional[int] = None,
         dae_num_train_timesteps: int = 0,
