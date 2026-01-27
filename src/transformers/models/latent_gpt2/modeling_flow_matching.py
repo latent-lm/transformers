@@ -672,7 +672,7 @@ class LanguageFlowMatching(GPT2PreTrainedModel, GenerationMixin):
         # logits = self._project_with_multi_heads(latents[:, slice_indices, :])
 
         loss = None
-        if labels is not None:
+        if velocity is not None:
             # Flatten the tokens
             loss = self.loss_function(
                 logits=logits,
@@ -735,13 +735,22 @@ class LanguageFlowMatching(GPT2PreTrainedModel, GenerationMixin):
             velocity = labels - noise
         else:
             # Inference mode
-            if inputs_prev_latent is None:
-                raise ValueError("If labels is missing, inputs_prev_latent, inputs_latent_timestep, and inputs_embeds are required, but inputs_prev_latent is missing.")
-            if inputs_latent_timestep is None:
-                raise ValueError("If labels is missing, inputs_prev_latent, inputs_latent_timestep, and inputs_embeds are required, but inputs_latent_timestep is missing.")
+            velocity = None
             if inputs_embeds is None:
-                raise ValueError("If labels is missing, inputs_prev_latent, inputs_latent_timestep, and inputs_embeds are required, but inputs_embeds is missing.")
-        return inputs_prev_latent, inputs_latent_timestep, velocity
+                raise ValueError("If labels is missing, inputs_embeds is required, but inputs_embeds is missing.")
+            # if inputs_prev_latent is None:
+            #     raise ValueError("If labels is missing, inputs_prev_latent, inputs_latent_timestep, and inputs_embeds are required, but inputs_prev_latent is missing.")
+            # if inputs_latent_timestep is None:
+            #     raise ValueError("If labels is missing, inputs_prev_latent, inputs_latent_timestep, and inputs_embeds are required, but inputs_latent_timestep is missing.")
+
+            if inputs_prev_latent is None and inputs_latent_timestep is None:
+                inputs_latent_timestep = torch.rand(inputs_embeds.shape[0], 1, device=inputs_embeds.device)
+                inputs_prev_latent = self.transformer._rand_latent(batch_size=inputs_embeds.shape[0], device=inputs_embeds.device)
+                return inputs_prev_latent, inputs_latent_timestep, velocity
+            elif inputs_prev_latent is not None and inputs_latent_timestep is not None:
+                return inputs_prev_latent, inputs_latent_timestep, velocity
+            else:
+                raise ValueError("If labels is missing, inputs_prev_latent and inputs_latent_timestep shoule be provided simultaneously or neither, but only one of them is provided.")
     
     def _simple_model_call(
         self,
