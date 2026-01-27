@@ -13,18 +13,45 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""PyTorch OpenAI GPT-2 model."""
+
+"""
+Language Autoencoder based on GPT-2.
+
+This module implements a language autoencoder that compresses text into latent representations
+using a windowed encoding scheme and reconstructs text using multi-head decoding.
+
+Architecture Overview:
+    - Encoder: Processes input tokens in windows of `window_size` and outputs one latent per window
+    - Decoder: Takes one latent per window and outputs `window_size` tokens using multi-head projection
+
+Tensor Shape Flow (where num_segments = ceil(seq_len / window_size)):
+    Encoding:
+        input_ids: (batch_size, seq_len)
+        -> pad to multiple of window_size: (batch_size, padded_seq_len)
+        -> reshape for windowed processing: (batch_size * num_segments, window_size)
+        -> transformer: (batch_size * num_segments, window_size, hidden_size)
+        -> take last position: (batch_size * num_segments, 1, hidden_size)
+        -> reshape: (batch_size, num_segments, hidden_size)
+        -> project to latent: (batch_size, num_segments, latent_dim)
+
+    Decoding:
+        latents: (batch_size, num_segments, latent_dim)
+        -> project to hidden: (batch_size, num_segments, hidden_size)
+        -> reshape for transformer: (batch_size * num_segments, 1, hidden_size)
+        -> transformer: (batch_size * num_segments, 1, hidden_size)
+        -> reshape back: (batch_size, num_segments, hidden_size)
+        -> multi-head projection: window_size heads, each (batch_size, num_segments, vocab_size)
+        -> interleave and reshape: (batch_size, num_segments * window_size, vocab_size)
+"""
 
 import copy
-import math
 import warnings
-from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
 import torch
 from torch import nn
 
-from ...cache_utils import Cache, DynamicCache, EncoderDecoderCache
+from ...cache_utils import Cache
 from ...generation import GenerationMixin
 from ...modeling_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
@@ -32,76 +59,98 @@ from ...modeling_outputs import (
     BaseAutoencoderOutputWithPastAndCrossAttentions,
     CausalLMAutoencoderOutputWithCrossAttentions,
 )
-from ...utils import (
-    auto_docstring,
-    logging,
-)
+from ...utils import logging
 from .configuration_latent_gpt2 import LatentGPT2Config
 from .modeling_gpt2 import GPT2ModelBase, GPT2PreTrainedModel, GPT2LMHeadModel, GPT2Block
 
 
 logger = logging.get_logger(__name__)
 
-@auto_docstring(
-    custom_intro="Base encoder model for language encoding with configurable number of layers.",
-)
+
+# =============================================================================
+# Base Classes for Encoder and Decoder
+# =============================================================================
+
+
 class LanguageEncoderBase(GPT2ModelBase):
+    """
+    Base encoder model with configurable number of transformer layers.
+
+    Inherits from GPT2ModelBase and uses the first `num_hidden_layers_encoder` layers.
+    """
+
     def __init__(self, config: LatentGPT2Config):
         super().__init__(config)
-
         self.embed_dim = config.hidden_size
-
         self.wte = nn.Embedding(config.vocab_size, self.embed_dim)
         self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
-
         self.drop = nn.Dropout(config.embd_pdrop)
-        self.h = nn.ModuleList([GPT2Block(config, layer_idx=i) for i in range(config.num_hidden_layers_encoder)])
+        self.h = nn.ModuleList([
+            GPT2Block(config, layer_idx=i)
+            for i in range(config.num_hidden_layers_encoder)
+        ])
         self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
-
         self.gradient_checkpointing = False
         self._attn_implementation = config._attn_implementation
-
-        # Initialize weights and apply final processing
         self.post_init()
 
 
-@auto_docstring(
-    custom_intro="Base decoder model for language decoding with configurable number of layers.",
-)
 class LanguageDecoderBase(GPT2ModelBase):
+    """
+    Base decoder model with configurable number of transformer layers.
+
+    Uses `wte_latent` to project from latent space to hidden dimension,
+    plus standard `wte` for token embeddings (used in diffusion decoding).
+    """
+
     def __init__(self, config: LatentGPT2Config):
         super().__init__(config)
-
         self.embed_dim = config.hidden_size
 
-        # Project from latent_dim to hidden_size (instead of token embedding)
+        # Latent-to-hidden projection (replaces token embedding for latent inputs)
         self.wte_latent = nn.Linear(config.latent_dim, self.embed_dim, bias=False)
+        # Standard token embedding (used for diffusion/mask decoding)
         self.wte = nn.Embedding(config.vocab_size, self.embed_dim)
         self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
 
         self.drop = nn.Dropout(config.embd_pdrop)
-        self.h = nn.ModuleList([GPT2Block(config, layer_idx=i) for i in range(config.num_hidden_layers_decoder)])
+        self.h = nn.ModuleList([
+            GPT2Block(config, layer_idx=i)
+            for i in range(config.num_hidden_layers_decoder)
+        ])
         self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
-
         self.gradient_checkpointing = False
         self._attn_implementation = config._attn_implementation
-
-        # Initialize weights and apply final processing
         self.post_init()
 
-        # Initialize wte_latent as identity matrix if dimensions match
+        # Initialize wte_latent as identity if dimensions match
         if config.latent_dim == self.embed_dim:
             with torch.no_grad():
                 self.wte_latent.weight.copy_(torch.eye(self.embed_dim))
 
+
+# =============================================================================
+# Sequence Window Utilities
+# =============================================================================
+
+
 class SequenceWindowUtilsBase:
-    """Base class for sequence windowing utilities with shared properties and padding methods."""
+    """
+    Base utility class for windowed sequence operations.
+
+    Provides methods to:
+    - Pad sequences to be divisible by window_size
+    - Split/aggregate sequences into windows
+    - Handle padding and masking tokens
+
+    Attributes:
+        TOKEN_TYPE_PADDING: Use padding token for filling
+        TOKEN_TYPE_MASKING: Use mask token for filling (diffusion models)
+    """
+
     TOKEN_TYPE_PADDING: str = "padding"
     TOKEN_TYPE_MASKING: str = "masking"
-    SUPPORTED_TOKEN_TYPES: List[str] = [
-        TOKEN_TYPE_PADDING,
-        TOKEN_TYPE_MASKING
-    ]
+    SUPPORTED_TOKEN_TYPES: List[str] = [TOKEN_TYPE_PADDING, TOKEN_TYPE_MASKING]
 
     def __init__(
         self,
@@ -110,345 +159,461 @@ class SequenceWindowUtilsBase:
         padding_embed: Optional[torch.FloatTensor] = None,
         masking_token: Optional[int] = None,
         masking_embed: Optional[torch.FloatTensor] = None,
-        wte: Optional[torch.nn.Embedding] = None,
+        wte: Optional[nn.Embedding] = None,
     ):
-        self._batch_size: int = None
-        self._seq_len: int = None
-        self._segment_num: int = None
+        """
+        Args:
+            window_size: Number of tokens per window/segment
+            padding_token: Token ID used for padding
+            padding_embed: Pre-computed embedding for padding (optional)
+            masking_token: Token ID used for masking (diffusion)
+            masking_embed: Pre-computed embedding for masking (optional)
+            wte: Token embedding layer (used to compute embeddings if not provided)
+        """
+        self._batch_size: Optional[int] = None
+        self._seq_len: Optional[int] = None
+        self._segment_num: Optional[int] = None
         self._window_size: int = window_size
         self._padding_token = padding_token
         self._padding_embed = padding_embed
         self._masking_token = masking_token
         self._masking_embed = masking_embed
-        self._wte: torch.nn.Embedding = wte
+        self._wte: Optional[nn.Embedding] = wte
 
     @property
-    def batch_size(self):
+    def batch_size(self) -> Optional[int]:
         return self._batch_size
 
     @property
-    def seq_len(self):
+    def seq_len(self) -> Optional[int]:
         return self._seq_len
 
     @property
-    def segment_num(self):
+    def segment_num(self) -> Optional[int]:
         return self._segment_num
 
     @property
-    def window_size(self):
+    def window_size(self) -> int:
         return self._window_size
 
-    def _get_padding_embed(self) -> torch.FloatTensor:
-        if self._padding_embed is None:
-            if self._wte is None:
-                raise ValueError("To get padding_embed, either provide padding_embed or wte")
-            self._padding_embed = self._wte(self._padding_token)
-        return self._padding_embed
+    def _get_token(self, token_type: str) -> int:
+        """Get token ID for the specified type."""
+        if token_type == self.TOKEN_TYPE_PADDING:
+            if self._padding_token is None:
+                raise ValueError("padding_token is not set")
+            return self._padding_token
+        elif token_type == self.TOKEN_TYPE_MASKING:
+            if self._masking_token is None:
+                raise ValueError("masking_token is not set")
+            return self._masking_token
+        raise ValueError(f"Unsupported token_type: {token_type}. Supported: {self.SUPPORTED_TOKEN_TYPES}")
 
-    def _get_padding_token(self) -> torch.LongTensor:
-        if self._padding_token is None:
-            raise ValueError("padding_token is not set")
-        return self._padding_token
-    
-    def _get_masking_embed(self) -> torch.FloatTensor:
-        if self._masking_embed is None:
-            if self._wte is None:
-                raise ValueError("To get masking_embed, either provide masking_embed or wte")
-            self._masking_embed = self._wte(self._masking_token)
-        return self._masking_embed
+    def _get_embed(self, token_type: str) -> torch.FloatTensor:
+        """Get embedding for the specified token type (computes if not cached)."""
+        if token_type == self.TOKEN_TYPE_PADDING:
+            if self._padding_embed is None:
+                if self._wte is None:
+                    raise ValueError("Provide padding_embed or wte to compute embedding")
+                self._padding_embed = self._wte(torch.tensor(self._padding_token))
+            return self._padding_embed
+        elif token_type == self.TOKEN_TYPE_MASKING:
+            if self._masking_embed is None:
+                if self._wte is None:
+                    raise ValueError("Provide masking_embed or wte to compute embedding")
+                self._masking_embed = self._wte(torch.tensor(self._masking_token))
+            return self._masking_embed
+        raise ValueError(f"Unsupported token_type: {token_type}. Supported: {self.SUPPORTED_TOKEN_TYPES}")
 
-    def _get_masking_token(self) -> torch.LongTensor:
-        if self._masking_token is None:
-            raise ValueError("masking_token is not set")
-        return self._masking_token
-    
-    def _get_used_token(self, token_type: str):
-        if token_type == SequenceWindowUtilsBase.TOKEN_TYPE_PADDING:
-            return self._get_padding_token()
-        elif token_type == SequenceWindowUtilsBase.TOKEN_TYPE_MASKING:
-            return self._get_masking_token()
-        else:
-            raise ValueError(f"token_type, {token_type}, isn't supported, only support {SequenceWindowUtilsBase.SUPPORTED_TOKEN_TYPES}")
-        
-    def _get_used_embed(self, token_type: str):
-        if token_type == SequenceWindowUtilsBase.TOKEN_TYPE_PADDING:
-            return self._get_padding_embed()
-        elif token_type == SequenceWindowUtilsBase.TOKEN_TYPE_MASKING:
-            return self._get_masking_embed()
-        else:
-            raise ValueError(f"token_type, {token_type}, isn't supported, only support {SequenceWindowUtilsBase.SUPPORTED_TOKEN_TYPES}")
-
-    def pad(self, sequence: Optional[torch.Tensor] = None, token_type: str = "padding") -> torch.Tensor:
+    def pad(
+        self,
+        sequence: Optional[torch.Tensor],
+        token_type: str = TOKEN_TYPE_PADDING
+    ) -> Optional[torch.Tensor]:
         """
-        Pad the given sequence to be a multiple of window_size.
+        Pad sequence length to be divisible by window_size.
 
-        If sequence is None, return None.
-        For 2D sequence (batch_size, seq_len), pad with padding_token.
-        For 3D sequence (batch_size, seq_len, embedding_size), pad with padding_embed.
+        Args:
+            sequence: Input tensor
+                - 2D (batch_size, seq_len): pads with token IDs
+                - 3D (batch_size, seq_len, embed_dim): pads with embeddings
+            token_type: "padding" or "masking"
 
         Returns:
-            torch.Tensor: Padded sequence with length divisible by window_size.
+            Padded sequence with seq_len divisible by window_size
         """
         if sequence is None:
-            return sequence
-        batch_size: int = sequence.shape[0]
-        seq_len: int = sequence.shape[1]
-        pad_len: int = (self._window_size - (seq_len % self._window_size)) % self._window_size
+            return None
 
+        batch_size, seq_len = sequence.shape[0], sequence.shape[1]
+        # Calculate padding needed to make seq_len divisible by window_size
+        # Example: seq_len=10, window_size=4 -> pad_len = (4 - 10%4) % 4 = (4-2)%4 = 2
+        pad_len = (self._window_size - (seq_len % self._window_size)) % self._window_size
+
+        # No padding needed if already divisible
         if pad_len == 0:
             return sequence
 
         if sequence.dim() == 2:
-            pad = torch.full((batch_size, pad_len), self._get_used_token(token_type=token_type),
-                           dtype=sequence.dtype, device=sequence.device)
+            # Token IDs: (batch_size, seq_len) -> (batch_size, padded_len)
+            pad = torch.full(
+                (batch_size, pad_len),
+                self._get_token(token_type),
+                dtype=sequence.dtype,
+                device=sequence.device
+            )
         elif sequence.dim() == 3:
-            pad = self._get_used_embed(token_type=token_type).expand(batch_size, pad_len, -1).to(
-                dtype=sequence.dtype, device=sequence.device)
+            # Embeddings: (batch_size, seq_len, embed_dim) -> (batch_size, padded_len, embed_dim)
+            pad = self._get_embed(token_type).expand(batch_size, pad_len, -1).to(
+                dtype=sequence.dtype, device=sequence.device
+            )
         else:
-            raise NotImplementedError(f"Unsupported input dimension: {sequence.dim()} with shape {sequence.shape}")
+            raise NotImplementedError(f"Unsupported dimension: {sequence.dim()}, shape: {sequence.shape}")
+
         return torch.cat((sequence, pad), dim=1)
 
-    def split_sequence(self, sequence: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Split a windowed sequence back to batch dimensions."""
+    def split_sequence(self, sequence: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        """
+        Reshape windowed sequence back to batch dimensions.
+
+        Args:
+            sequence: Shape (batch_size * segment_num, window_len, ...)
+
+        Returns:
+            Shape (batch_size, segment_num * window_len, ...)
+        """
         if sequence is None:
-            return sequence
-        return sequence.reshape(self._batch_size, self._segment_num * sequence.shape[1], *sequence.shape[2:])
-    
+            return None
+
+        # Inverse of agg_sequence: restore batch dimension from flattened segments
+        # (batch * num_segments, window_len, ...) -> (batch, num_segments * window_len, ...)
+        # This merges all segment outputs back into a single sequence per batch item
+        return sequence.reshape(
+            self._batch_size,
+            self._segment_num * sequence.shape[1],
+            *sequence.shape[2:]
+        )
+
     def split_context_target(
         self,
         sequence: torch.Tensor,
         is_padding: bool = True,
-    ) -> Tuple[torch.Tensor]:
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        Split sequence into context (all but last window) and target (last window).
+
+        Args:
+            sequence: Input tensor (2D or 3D)
+            is_padding: Whether to pad context to be divisible by window_size
+
+        Returns:
+            (context, target) tuple
+        """
         if sequence is None:
-            return None
+            return None, None
+
         if sequence.dim() == 2:
-            context: torch.Tensor = sequence[..., :-self._window_size].contiguous()
-            target: torch.Tensor = sequence[..., -self._window_size:].contiguous()
-            if is_padding:
-                context: torch.Tensor = self.pad(sequence=context)
+            context = sequence[..., :-self._window_size].contiguous()
+            target = sequence[..., -self._window_size:].contiguous()
         elif sequence.dim() > 2:
-            context: torch.Tensor = sequence[..., :-self._window_size, :].contiguous()
-            target: torch.Tensor = sequence[..., -self._window_size:, :].contiguous()
-            if is_padding:
-                context: torch.Tensor = self.pad(sequence=context)
+            context = sequence[..., :-self._window_size, :].contiguous()
+            target = sequence[..., -self._window_size:, :].contiguous()
         else:
-            raise NotImplementedError(f"Unsupported input dimension: {sequence.dim()} with shape {sequence.shape}")
+            raise NotImplementedError(f"Unsupported dimension: {sequence.dim()}")
+
+        if is_padding:
+            context = self.pad(sequence=context)
         return context, target
-    
+
     def split_context_target_then_cat(
         self,
         sequence: torch.Tensor,
         is_padding: bool = True,
         return_context_target: bool = False,
-    ) -> Tuple[torch.Tensor]:
+    ) -> Union[Optional[torch.Tensor], Tuple[Optional[torch.Tensor], ...]]:
+        """
+        Split into context/target, optionally pad context, then concatenate.
+
+        Returns:
+            If return_context_target=False: concatenated sequence
+            If return_context_target=True: (concatenated, context, target)
+        """
         if sequence is None:
-            if return_context_target:
-                return None, None, None
-            return None
+            return (None, None, None) if return_context_target else None
+
         context, target = self.split_context_target(sequence=sequence, is_padding=is_padding)
+
         if sequence.dim() == 2:
             joint_seq = torch.cat((context, target), dim=-1)
-        elif sequence.dim() > 2:
-            joint_seq = torch.cat((context, target), dim=-2)
         else:
-            raise NotImplementedError(f"Unsupported input dimension: {sequence.dim()} with shape {sequence.shape}")
+            joint_seq = torch.cat((context, target), dim=-2)
+
         if return_context_target:
             return joint_seq, context, target
         return joint_seq
 
-@auto_docstring(custom_intro="Utility class for language encoding with fixed-size window aggregation.")
+
 class LanguageEncoderUtils(SequenceWindowUtilsBase):
-    """Encoder utilities that aggregate sequences into fixed-size windows."""
+    """
+    Encoder-specific utilities for aggregating sequences into fixed-size windows.
 
-    def agg_sequence(self, sequence: Optional[torch.Tensor] = None) -> torch.Tensor:
+    Encoding flow:
+        (batch_size, seq_len) -> pad -> (batch_size, padded_len)
+        -> reshape -> (batch_size * num_segments, window_size)
+    """
+
+    def agg_sequence(self, sequence: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         """
-        Aggregate a sequence into fixed-size windows.
+        Aggregate sequence into windows for encoder processing.
 
         Args:
-            sequence: The sequence to aggregate. Shape (batch_size, seq_len) or (batch_size, seq_len, embed_dim).
+            sequence: Shape (batch_size, seq_len) or (batch_size, seq_len, embed_dim)
 
         Returns:
-            Aggregated sequence with shape (batch_size * segment_num, window_size, ...).
+            Shape (batch_size * segment_num, window_size) or
+                  (batch_size * segment_num, window_size, embed_dim)
         """
         if sequence is None:
-            return sequence
+            return None
+
+        # Store original batch dimensions for later reshaping back
         self._batch_size = sequence.shape[0]
         self._seq_len = sequence.shape[1]
-        padded_sequence = self.pad(sequence=sequence, token_type=SequenceWindowUtilsBase.TOKEN_TYPE_PADDING)
-        self._segment_num = padded_sequence.shape[1] // self._window_size
-        return padded_sequence.view(self._batch_size * self._segment_num, self._window_size, *padded_sequence.shape[2:])
+
+        # Pad sequence to be divisible by window_size
+        padded = self.pad(sequence=sequence, token_type=self.TOKEN_TYPE_PADDING)
+
+        # Calculate number of segments (windows) after padding
+        self._segment_num = padded.shape[1] // self._window_size
+
+        # Reshape: (batch, padded_len, ...) -> (batch * num_segments, window_size, ...)
+        # This allows processing each window independently through the transformer
+        return padded.view(
+            self._batch_size * self._segment_num,
+            self._window_size,
+            *padded.shape[2:]
+        )
 
 
-@auto_docstring(custom_intro="Utility class for language decoding with fixed-size window disaggregation.")
 class LanguageDecoderUtils(SequenceWindowUtilsBase):
-    """Decoder utilities that handle single-element and window-based sequence operations."""
+    """
+    Decoder-specific utilities for processing latents and aggregating outputs.
 
-    def agg_sequence(self, sequence: Optional[torch.Tensor] = None) -> torch.Tensor:
+    Standard decoding flow (one latent -> window_size tokens):
+        (batch_size, num_segments, latent_dim)
+        -> reshape -> (batch_size * num_segments, 1, latent_dim)
+
+    Multi-head output flow:
+        window_size heads each produce (batch_size * num_segments, 1, vocab_size)
+        -> interleave -> (batch_size, num_segments * window_size, vocab_size)
+    """
+
+    def agg_sequence(self, sequence: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         """
-        Aggregate a sequence into single-element segments.
+        Reshape latents for decoder: each latent becomes a single-token sequence.
 
         Args:
-            sequence: The sequence to aggregate. Shape (batch_size, seq_len, ...).
+            sequence: Shape (batch_size, num_segments, ...)
 
         Returns:
-            Aggregated sequence with shape (batch_size * seq_len, 1, ...).
+            Shape (batch_size * num_segments, 1, ...)
         """
         if sequence is None:
-            return sequence
+            return None
+
+        # Store dimensions for later reshaping back to batch form
         self._batch_size = sequence.shape[0]
         self._seq_len = sequence.shape[1]
-        self._segment_num = sequence.shape[1]
+        self._segment_num = sequence.shape[1]  # Each latent is one segment
+
+        # Reshape: (batch, num_segments, latent_dim) -> (batch * num_segments, 1, latent_dim)
+        # Each latent vector becomes a single-position sequence for the transformer
+        # The "1" dimension is needed because transformers expect (batch, seq_len, hidden)
         return sequence.view(self._batch_size * self._segment_num, 1, *sequence.shape[2:])
 
-    def _agg_sequence_by_window(
-        self,
-        sequence: Optional[torch.Tensor] = None,
-        token_type: str = SequenceWindowUtilsBase.TOKEN_TYPE_PADDING,
-    ) -> torch.Tensor:
+    def agg_sequence_by_window_size(self, sequence: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         """
-        Internal method to aggregate a sequence into window_size-length segments.
+        Aggregate sequence into window_size-length segments (used for diffusion decoding).
 
         Args:
-            sequence: The sequence to aggregate. Shape (batch_size, seq_len, ...).
-            token_type: Token type for padding ("padding" or "masking").
+            sequence: Shape (batch_size, seq_len, ...)
 
         Returns:
-            Aggregated sequence with shape (batch_size * segment_num, window_size, ...).
+            Shape (batch_size * segment_num, window_size, ...)
         """
         if sequence is None:
-            return sequence
+            return None
         self._batch_size = sequence.shape[0]
         self._seq_len = sequence.shape[1]
-        padded_sequence = self.pad(sequence=sequence, token_type=token_type)
-        self._segment_num = padded_sequence.shape[1] // self._window_size
-        return padded_sequence.view(self._batch_size * self._segment_num, self._window_size, *padded_sequence.shape[2:])
+        padded = self.pad(sequence=sequence, token_type=self.TOKEN_TYPE_PADDING)
+        self._segment_num = padded.shape[1] // self._window_size
+        return padded.view(
+            self._batch_size * self._segment_num,
+            self._window_size,
+            *padded.shape[2:]
+        )
 
-    def agg_sequence_by_window_size(self, sequence: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def agg_sequence_mask_diffusion(self, sequence: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         """
-        Aggregate a sequence into window_size-length segments, padding if necessary.
+        Aggregate masked sequence for diffusion decoding (pads with mask tokens).
 
         Args:
-            sequence: The sequence to aggregate. Shape (batch_size, seq_len, ...).
+            sequence: Shape (batch_size, seq_len, ...)
 
         Returns:
-            Aggregated sequence with shape (batch_size * segment_num, window_size, ...).
+            Shape (batch_size * segment_num, window_size, ...)
         """
-        return self._agg_sequence_by_window(sequence, token_type=SequenceWindowUtilsBase.TOKEN_TYPE_PADDING)
-
-    def agg_sequence_mask_diffusion(self, sequence: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Aggregate a masked sequence into window_size-length segments for diffusion decoding.
-
-        Used in mask diffusion models where the decoder receives masked token IDs
-        that need to be reshaped to match the windowed structure. Pads with mask
-        tokens if sequence length is not divisible by window_size.
-
-        Args:
-            sequence: The masked token sequence. Shape (batch_size, seq_len, ...).
-
-        Returns:
-            Aggregated sequence with shape (batch_size * segment_num, window_size, ...).
-        """
-        return self._agg_sequence_by_window(sequence, token_type=SequenceWindowUtilsBase.TOKEN_TYPE_MASKING)
+        if sequence is None:
+            return None
+        self._batch_size = sequence.shape[0]
+        self._seq_len = sequence.shape[1]
+        padded = self.pad(sequence=sequence, token_type=self.TOKEN_TYPE_MASKING)
+        self._segment_num = padded.shape[1] // self._window_size
+        return padded.view(
+            self._batch_size * self._segment_num,
+            self._window_size,
+            *padded.shape[2:]
+        )
 
     def flatten_multi_heads_logits(self, logits: List[torch.Tensor]) -> torch.Tensor:
         """
-        Flatten multi-head logits into a single sequence.
+        Interleave multi-head logits into a single sequence.
+
+        Each head predicts one position in the output window. This method interleaves
+        the predictions so position 0 of each segment comes from head 0, position 1
+        from head 1, etc.
 
         Args:
-            logits: List of tensors of shape (batch_size, segment_num, vocab_size) with length window_size.
+            logits: List of length window_size, each shape (batch_size, num_segments, vocab_size)
 
         Returns:
-            Flattened logits with shape (batch_size, segment_num * window_size, vocab_size).
+            Shape (batch_size, num_segments * window_size, vocab_size)
+            Positions are interleaved: [seg0_pos0, seg0_pos1, ..., seg1_pos0, seg1_pos1, ...]
         """
-        flatten_seq_shape = (self._batch_size, self._segment_num * self._window_size, *logits[0].shape[2:])
-        return torch.stack(logits, dim=2).view(flatten_seq_shape)
-    
-    def pad(self, sequence: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Pad the given sequence to be a multiple of window_size.
+        # Stack all head outputs along a new dimension (dim=2)
+        # Before: list of window_size tensors, each (batch, num_segments, vocab_size)
+        # After stack: (batch, num_segments, window_size, vocab_size)
+        stacked = torch.stack(logits, dim=2)
 
-        If sequence is None, return None.
-        For 2D sequence (batch_size, seq_len), pad with padding_token.
-        For 3D sequence (batch_size, seq_len, embedding_size), pad with padding_embed.
+        # Flatten to interleave positions from each segment
+        # (batch, num_segments, window_size, vocab_size) -> (batch, num_segments * window_size, vocab_size)
+        # Result ordering: [seg0_tok0, seg0_tok1, ..., seg0_tokW, seg1_tok0, seg1_tok1, ...]
+        # This matches the original input token ordering after padding
+        return stacked.view(
+            self._batch_size,
+            self._segment_num * self._window_size,
+            *logits[0].shape[2:]
+        )
 
-        Returns:
-            torch.Tensor: Padded sequence with length divisible by window_size.
-        """
-        return super().pad(sequence=sequence, token_type=SequenceWindowUtilsBase.TOKEN_TYPE_PADDING)
+    def pad(self, sequence: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        """Pad with padding tokens (convenience override)."""
+        return super().pad(sequence=sequence, token_type=self.TOKEN_TYPE_PADDING)
 
-@auto_docstring(
-    custom_intro="Language encoder model based on GPT-2 for encoding text into latent representations.",
-    custom_args="window_size (`int`): The window size for aggregating input sequences into segments.",
-)
+
+# =============================================================================
+# Encoder Models
+# =============================================================================
+
+
 class LanguageEncoder(LanguageEncoderBase):
+    """
+    Language encoder that processes text in windows and produces latent representations.
+
+    Processing flow:
+        1. Input: (batch_size, seq_len)
+        2. Pad to multiple of window_size: (batch_size, padded_len)
+        3. Reshape to windows: (batch_size * num_segments, window_size)
+        4. Transformer: (batch_size * num_segments, window_size, hidden_size)
+        5. Extract last position: (batch_size, num_segments, hidden_size)
+    """
+
     def __init__(self, config: LatentGPT2Config):
         super().__init__(config)
         self.ae_utils = LanguageEncoderUtils(
-            window_size = config.window_size,
-            padding_token = config.pad_token_id,
-            padding_embed = None,
+            window_size=config.window_size,
+            padding_token=config.pad_token_id,
             wte=self.wte,
         )
-        # Initialize weights and apply final processing
         self.post_init()
+
     def pre_process_inputs(
         self,
         input_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
     ) -> PreprocessOutput:
         """
-        Pre-processes and segments the inputs for the language encoder.
+        Aggregate inputs into windows for transformer processing.
 
         Args:
-            input_ids (Optional[torch.LongTensor]): The input ids.
-            inputs_embeds (Optional[torch.FloatTensor]): The input embeddings.
+            input_ids: Shape (batch_size, seq_len)
+            inputs_embeds: Shape (batch_size, seq_len, hidden_size)
 
         Returns:
-            A tuple containing the pre-processed input ids and embeddings.
+            PreprocessOutput with shapes (batch_size * num_segments, window_size, ...)
         """
         if input_ids is not None:
             input_ids = self.ae_utils.agg_sequence(sequence=input_ids)
         if inputs_embeds is not None:
             inputs_embeds = self.ae_utils.agg_sequence(sequence=inputs_embeds)
         return PreprocessOutput(input_ids=input_ids, inputs_embeds=inputs_embeds)
+
     def post_process_outputs(
         self,
         outputs: BaseModelOutputWithPastAndCrossAttentions,
     ) -> BaseAutoencoderOutputWithPastAndCrossAttentions:
         """
-        Post-processes and segment the outputs of the language encoder.
+        Reshape transformer outputs back to batch dimensions.
 
         Args:
-            outputs: The output of the language encoder.
+            outputs: Transformer outputs with last_hidden_state shape
+                     (batch_size * num_segments, window_size, hidden_size)
 
         Returns:
-            The processed output of the language encoder.
+            Autoencoder outputs with:
+            - last_tail_hidden_state: (batch_size, num_segments, hidden_size) [last position only]
+            - last_window_hidden_state: (batch_size, num_segments * window_size, hidden_size) [last window]
+            - last_hidden_state: (batch_size, padded_len, hidden_size) [full sequence]
         """
         if outputs is None:
             return outputs
+
+        # Transformer output shape: (batch * num_segments, window_size, hidden_size)
+        last_hidden = outputs.last_hidden_state
+
         return BaseAutoencoderOutputWithPastAndCrossAttentions(
-            # Only keep the last hidden_state of hidden_state of the last layer
-            last_tail_hidden_state=self.ae_utils.split_sequence(sequence=outputs.last_hidden_state[:, -1:, ...]) if outputs.last_hidden_state is not None else None,
-            # Only keep the last self.config.window_size hidden_state of hidden_state of the last layer
-            last_window_hidden_state=self.ae_utils.split_sequence(sequence=outputs.last_hidden_state[:, -self.config.window_size:, ...]) if outputs.last_hidden_state is not None else None,
-            last_hidden_state=self.ae_utils.split_sequence(sequence=outputs.last_hidden_state) if outputs.last_hidden_state is not None else None,
+            # Extract only the last position of each window as the latent representation
+            # Shape: (batch * num_segments, 1, hidden) -> (batch, num_segments, hidden)
+            # This is the key compression: window_size tokens -> 1 latent vector
+            last_tail_hidden_state=(
+                self.ae_utils.split_sequence(last_hidden[:, -1:, ...])
+                if last_hidden is not None else None
+            ),
+            # Extract the last window_size positions (entire last window)
+            # Shape: (batch * num_segments, window_size, hidden) -> (batch, num_segments * window_size, hidden)
+            last_window_hidden_state=(
+                self.ae_utils.split_sequence(last_hidden[:, -self.config.window_size:, ...])
+                if last_hidden is not None else None
+            ),
+            # Full sequence reshaped back to batch form
+            # Shape: (batch * num_segments, window_size, hidden) -> (batch, padded_seq_len, hidden)
+            last_hidden_state=(
+                self.ae_utils.split_sequence(last_hidden)
+                if last_hidden is not None else None
+            ),
             past_key_values=outputs.past_key_values,
-            hidden_states=tuple(self.ae_utils.split_sequence(sequence=hidden_state) for hidden_state in outputs.hidden_states) if outputs.hidden_states is not None else None,
-            # TODO: Handle attentions and cross_attentions reshaping
+            # Reshape all intermediate layer hidden states
+            hidden_states=(
+                tuple(self.ae_utils.split_sequence(h) for h in outputs.hidden_states)
+                if outputs.hidden_states is not None else None
+            ),
             attentions=outputs.attentions,
             cross_attentions=outputs.cross_attentions,
         )
 
-    def init_weight_from_pretrained(self, pretrained_model: GPT2ModelBase):
+    def init_weight_from_pretrained(self, pretrained_model: GPT2ModelBase) -> "LanguageEncoder":
         """
-        Initializes the language encoder from a pre-trained model.
+        Initialize encoder weights from a pretrained GPT-2 model.
 
-        Args:
-            pretrained_model: The pre-trained model to use.
-
-        Returns:
-            A new instance of the class.
+        Uses the first `num_hidden_layers_encoder` layers from the pretrained model.
         """
         self.wte = copy.deepcopy(pretrained_model.wte)
         self.wpe = copy.deepcopy(pretrained_model.wpe)
@@ -456,17 +621,14 @@ class LanguageEncoder(LanguageEncoderBase):
         self.h = copy.deepcopy(pretrained_model.h[:self.config.num_hidden_layers_encoder])
         self.ln_f = copy.deepcopy(pretrained_model.ln_f)
         self.gradient_checkpointing = pretrained_model.gradient_checkpointing
-        
-        # Re-index blocks to match the new layer positions (0 to num_hidden_layers_decoder-1)
+
+        # Re-index layer indices for attention caching
         for new_idx, block in enumerate(self.h):
             block.attn.layer_idx = new_idx
             if hasattr(block, 'crossattention'):
                 block.crossattention.layer_idx = new_idx
         return self
 
-    @auto_docstring(
-        custom_args="return_segment (`bool`, *optional*, defaults to `True`): Whether to return segmented outputs.",
-    )
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -485,17 +647,29 @@ class LanguageEncoder(LanguageEncoderBase):
         return_segment: bool = True,
         **kwargs,
     ) -> Union[tuple, BaseAutoencoderOutputWithPastAndCrossAttentions]:
+        """
+        Forward pass for the language encoder.
+
+        Args:
+            input_ids: Shape (batch_size, seq_len)
+            inputs_embeds: Shape (batch_size, seq_len, hidden_size)
+            return_segment: Whether to return segmented outputs (always True for encoder)
+
+        Returns:
+            BaseAutoencoderOutputWithPastAndCrossAttentions with windowed hidden states
+        """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        pre_process_res: PreprocessOutput = self.pre_process_inputs(input_ids=input_ids, inputs_embeds=inputs_embeds)
+        preprocessed = self.pre_process_inputs(input_ids=input_ids, inputs_embeds=inputs_embeds)
+
         output = super().forward(
-            input_ids=pre_process_res.input_ids,
+            input_ids=preprocessed.input_ids,
             past_key_values=past_key_values,
             cache_position=cache_position,
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
             position_ids=position_ids,
-            inputs_embeds=pre_process_res.inputs_embeds,
+            inputs_embeds=preprocessed.inputs_embeds,
             encoder_hidden_states=encoder_hidden_states,
             encoder_attention_mask=encoder_attention_mask,
             use_cache=use_cache,
@@ -505,45 +679,40 @@ class LanguageEncoder(LanguageEncoderBase):
             **kwargs,
         )
         return self.post_process_outputs(outputs=output)
-        
+
+
 class LanguageEncoderLatentHead(GPT2PreTrainedModel, GenerationMixin):
-    # No tied weights since latent_head projects to latent_dim, not vocab_size
+    """
+    Language encoder with a projection head to latent space.
+
+    Processing flow:
+        1. Encode text via LanguageEncoder
+        2. Project last hidden state to latent dimension
+
+    Output shapes:
+        - latents: (batch_size, num_segments, latent_dim)
+        - logits: Same as latents (the latent projection)
+    """
 
     def __init__(self, config: LatentGPT2Config):
         super().__init__(config)
         self.transformer = LanguageEncoder(config=config)
-        # Project from hidden_state to latent_dim
         self.latent_head = nn.Linear(config.n_embd, config.latent_dim, bias=False)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-
-        # Initialize weights and apply final processing
         self.post_init()
 
-        # Initialize latent_head as identity matrix if dimensions match
+        # Initialize latent_head as identity if dimensions match
         if config.n_embd == config.latent_dim:
             with torch.no_grad():
                 self.latent_head.weight.copy_(torch.eye(config.n_embd))
-        
-    def init_weight_from_pretrained(self, pretrained_model: GPT2LMHeadModel):
-        """
-        Initializes the language encoder from a pre-trained model.
 
-        Args:
-            pretrained_model: The pre-trained model to use.
-
-        Returns:
-            A new instance of the class.
-        """
-        self.transformer.init_weight_from_pretrained(pretrained_model=pretrained_model.transformer)
-        # latent_head is not copied from pretrained model since it projects to latent_dim, not vocab_size
-        # It will be initialized with random weights
+    def init_weight_from_pretrained(self, pretrained_model: GPT2LMHeadModel) -> "LanguageEncoderLatentHead":
+        """Initialize from pretrained GPT-2 LM model."""
+        self.transformer.init_weight_from_pretrained(pretrained_model.transformer)
         self.lm_head = copy.deepcopy(pretrained_model.lm_head)
+        # latent_head is randomly initialized (projects to latent_dim, not vocab)
         return self
 
-    @auto_docstring(
-        custom_intro="Forward pass for the language encoder with LM head.",
-        checkpoint="GPT2PreTrainedModel",
-    )
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -563,23 +732,18 @@ class LanguageEncoderLatentHead(GPT2PreTrainedModel, GenerationMixin):
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs,
     ) -> Union[tuple, CausalLMAutoencoderOutputWithCrossAttentions]:
-        r"""
-        input_ids (`torch.LongTensor` of shape `(batch_size, input_ids_length)`):
-            `input_ids_length` = `sequence_length` if `past_key_values` is `None` else
-            `past_key_values.get_seq_length()` (`sequence_length` of input past key value states). Indices of input
-            sequence tokens in the vocabulary.
+        """
+        Forward pass for encoder with latent head.
 
-            If `past_key_values` is used, only `input_ids` that do not have their past calculated should be passed as
-            `input_ids`.
+        Args:
+            input_ids: Shape (batch_size, seq_len)
+            logits_to_keep: Number of final positions to project (0 = all)
 
-            Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.encode`] and
-            [`PreTrainedTokenizer.__call__`] for details.
-
-            [What are input IDs?](../glossary#input-ids)
-        labels (`torch.LongTensor` of shape `(batch_size, input_ids_length)`, *optional*):
-            Labels for language modeling. Note that the labels **are shifted** inside the model, i.e. you can set
-            `labels = input_ids` Indices are selected in `[-100, 0, ..., config.vocab_size]` All labels set to `-100`
-            are ignored (masked), the loss is only computed for labels in `[0, ..., config.vocab_size]`
+        Returns:
+            CausalLMAutoencoderOutputWithCrossAttentions with:
+            - logits: (batch_size, num_segments, latent_dim) - latent projections
+            - latents: Same as logits
+            - latent_embeds: (batch_size, num_segments, hidden_size) - pre-projection hidden states
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -598,38 +762,56 @@ class LanguageEncoderLatentHead(GPT2PreTrainedModel, GenerationMixin):
             output_hidden_states=True,
             return_dict=True,
         )
-        # Only use the last hidden_state of the last layer as latent
-        latents = transformer_outputs.last_tail_hidden_state
-        
-        # Project the latents to logits
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.latent_head(latents[:, slice_indices, :])
 
-        loss = None
+        # Use last position of each window as latent representation
+        # Shape: (batch_size, num_segments, hidden_size)
+        # Each segment's last token summarizes the entire window
+        latent_embeds = transformer_outputs.last_tail_hidden_state
+
+        # Handle logits_to_keep: 0 means keep all, N means keep last N positions
+        # slice(-0, None) = slice(0, None) = all elements (correct behavior for 0)
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+
+        # Project hidden states to latent space
+        # Shape: (batch_size, num_segments, hidden_size) -> (batch_size, num_segments, latent_dim)
+        logits = self.latent_head(latent_embeds[:, slice_indices, :])
 
         if not return_dict:
             output = (logits,) + transformer_outputs[1:]
-            return ((loss,) + output) if loss is not None else output
+            return output
 
         return CausalLMAutoencoderOutputWithCrossAttentions(
             last_tail_hidden_state=transformer_outputs.last_tail_hidden_state if output_hidden_states else None,
             last_window_hidden_state=transformer_outputs.last_window_hidden_state if output_hidden_states else None,
             last_hidden_state=transformer_outputs.last_hidden_state if output_hidden_states else None,
-            loss=loss,
+            loss=None,
             logits=logits,
             past_key_values=transformer_outputs.past_key_values,
             hidden_states=transformer_outputs.hidden_states if output_hidden_states else None,
             attentions=transformer_outputs.attentions,
             cross_attentions=transformer_outputs.cross_attentions,
-            latent_embeds=transformer_outputs.last_tail_hidden_state,
+            latent_embeds=latent_embeds,
             latents=logits,
         )
-        
-@auto_docstring(
-    custom_intro="Language decoder model based on GPT-2 for decoding latent representations back to text.",
-    custom_args="window_size (`int`): The window size for disaggregating latent representations back to sequences.",
-)
+
+
+# =============================================================================
+# Decoder Models
+# =============================================================================
+
+
 class LanguageDecoder(LanguageDecoderBase):
+    """
+    Language decoder that reconstructs text from latent representations.
+
+    Processing flow:
+        1. Input latents: (batch_size, num_segments, latent_dim)
+        2. Project to hidden: (batch_size, num_segments, hidden_size)
+        3. Reshape: (batch_size * num_segments, 1, hidden_size)
+        4. Transformer: (batch_size * num_segments, 1, hidden_size)
+        5. Reshape back: (batch_size, num_segments, hidden_size)
+    """
+
     def __init__(self, config: LatentGPT2Config):
         super().__init__(config)
         self.ae_utils = LanguageDecoderUtils(
@@ -638,10 +820,8 @@ class LanguageDecoder(LanguageDecoderBase):
             masking_token=getattr(config, "mask_token_id", config.pad_token_id),
             wte=self.wte,
         )
-
-        # Initialize weights and apply final processing
         self.post_init()
-        
+
     def pre_process_inputs(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -649,75 +829,92 @@ class LanguageDecoder(LanguageDecoderBase):
         inputs_embeds: Optional[torch.FloatTensor] = None,
     ) -> PreprocessOutput:
         """
-        Pre-processes and segments the inputs for the language decoder.
+        Prepare inputs for decoder transformer.
 
         Args:
-            input_ids (Optional[torch.LongTensor]): The input ids.
-            inputs_embeds (Optional[torch.FloatTensor]): The input embeddings.
+            input_ids: Token IDs (not used in standard decoding, emits warning)
+            inputs_latents: Shape (batch_size, num_segments, latent_dim)
+            inputs_embeds: Shape (batch_size, num_segments, hidden_size)
 
         Returns:
-            A PreprocessOutput containing the pre-processed input ids and embeddings.
+            PreprocessOutput with inputs_embeds reshaped to
+            (batch_size * num_segments, 1, hidden_size)
         """
+        # Mutually exclusive: can't provide both latents and embeds
+        if inputs_latents is not None and inputs_embeds is not None:
+            raise ValueError("Provide either inputs_latents or inputs_embeds, not both")
+
+        # Reshape inputs for transformer processing
         if input_ids is not None:
+            # For diffusion decoding: reshape token IDs
             input_ids = self.ae_utils.agg_sequence(sequence=input_ids)
-        if inputs_latents is not None:
-            inputs_latents = self.ae_utils.agg_sequence(sequence=inputs_latents)
-            # if input_ids is not None:
-            #     raise ValueError(f"input_ids and inputs_latents are provided at the same time, only one of them is accepted.")
-        if inputs_embeds is not None:
-            inputs_embeds = self.ae_utils.agg_sequence(sequence=inputs_embeds)
-            # if input_ids is not None:
-            #     raise ValueError(f"input_ids and inputs_embeds are provided at the same time, only one of them is accepted.")
-            if inputs_latents is not None:
-                raise ValueError(f"inputs_latents and inputs_embeds are provided at the same time, only one of them is accepted.")
 
         if inputs_latents is not None:
+            # Standard decoding path: latents -> embeddings
+            # (batch, num_segments, latent_dim) -> (batch * num_segments, 1, latent_dim)
+            inputs_latents = self.ae_utils.agg_sequence(sequence=inputs_latents)
+            # Project latents to hidden dimension for transformer
+            # (batch * num_segments, 1, latent_dim) -> (batch * num_segments, 1, hidden_size)
             inputs_embeds = self.wte_latent(inputs_latents)
-        # if input_ids is not None:
-        #     inputs_embeds = self.wte_latent(input_ids)
-        return PreprocessOutput(input_ids=input_ids, inputs_latents=inputs_latents, inputs_embeds=inputs_embeds)
-    
+        elif inputs_embeds is not None:
+            # Direct embedding input (skip latent projection)
+            inputs_embeds = self.ae_utils.agg_sequence(sequence=inputs_embeds)
+
+        return PreprocessOutput(
+            input_ids=input_ids,
+            inputs_latents=inputs_latents,
+            inputs_embeds=inputs_embeds
+        )
+
     def post_process_outputs(
         self,
-        outputs: CausalLMAutoencoderOutputWithCrossAttentions,
-    ):
+        outputs: BaseModelOutputWithPastAndCrossAttentions,
+    ) -> BaseAutoencoderOutputWithPastAndCrossAttentions:
         """
-        Post-processes and segment the outputs of the language decoder.
+        Reshape transformer outputs back to batch dimensions.
 
         Args:
-            outputs: The output of the language decoder.
+            outputs: Transformer outputs with last_hidden_state shape
+                     (batch_size * num_segments, 1, hidden_size)
 
         Returns:
-            The processed output of the language decoder.
+            Autoencoder outputs with:
+            - last_tail_hidden_state: (batch_size, num_segments, hidden_size)
+            - last_window_hidden_state: Same as last_tail_hidden_state (decoder has seq_len=1)
+            - last_hidden_state: (batch_size, num_segments, hidden_size)
         """
         if outputs is None:
             return outputs
-        # The input last_hidden_state have already the last hidden_states of the last layer, no need to slice
+
+        last_hidden = outputs.last_hidden_state
+
+        # Decoder processes each latent independently (seq_len=1), so last_tail and full sequence are the same
+        # last_window_hidden_state is also the same since decoder has only 1 position per segment
+        reshaped_hidden = (
+            self.ae_utils.split_sequence(last_hidden)
+            if last_hidden is not None else None
+        )
+
         return BaseAutoencoderOutputWithPastAndCrossAttentions(
-            # Only keep the last hidden_state of hidden_state of the last layer
-            last_tail_hidden_state=self.ae_utils.split_sequence(sequence=outputs.last_hidden_state[:, -1:, ...]) if outputs.last_hidden_state is not None else None,
-            # Only keep the last self.config.window_size hidden_state of hidden_state of the last layer
-            last_window_hidden_state=self.ae_utils.split_sequence(sequence=outputs.last_hidden_state[:, -self.config.window_size:, ...]) if outputs.last_hidden_state is not None else None,
-            last_hidden_state=self.ae_utils.split_sequence(sequence=outputs.last_hidden_state) if outputs.last_hidden_state is not None else None,
+            last_tail_hidden_state=reshaped_hidden,
+            last_window_hidden_state=reshaped_hidden,
+            last_hidden_state=reshaped_hidden,
             past_key_values=outputs.past_key_values,
-            hidden_states=tuple(self.ae_utils.split_sequence(sequence=hidden_state) for hidden_state in outputs.hidden_states) if outputs.hidden_states is not None else None,
-            # TODO: Handle attentions and cross_attentions reshaping
+            hidden_states=(
+                tuple(self.ae_utils.split_sequence(h) for h in outputs.hidden_states)
+                if outputs.hidden_states is not None else None
+            ),
             attentions=outputs.attentions,
             cross_attentions=outputs.cross_attentions,
         )
 
-    def init_weight_from_pretrained(self, pretrained_model: GPT2ModelBase):
+    def init_weight_from_pretrained(self, pretrained_model: GPT2ModelBase) -> "LanguageDecoder":
         """
-        Initializes the language decoder from a pre-trained model.
+        Initialize decoder weights from a pretrained GPT-2 model.
 
-        Args:
-            pretrained_model: The pre-trained model to use.
-
-        Returns:
-            A new instance of the class.
+        Uses the last `num_hidden_layers_decoder` layers from the pretrained model.
+        Note: wte_latent is randomly initialized (projects from latent_dim).
         """
-        # wte is not copied since it's now a Linear(latent_dim -> hidden_size), not Embedding
-        # It will be initialized with random weights
         self.wte = copy.deepcopy(pretrained_model.wte)
         self.wpe = copy.deepcopy(pretrained_model.wpe)
         self.drop = copy.deepcopy(pretrained_model.drop)
@@ -725,14 +922,13 @@ class LanguageDecoder(LanguageDecoderBase):
         self.ln_f = copy.deepcopy(pretrained_model.ln_f)
         self.gradient_checkpointing = pretrained_model.gradient_checkpointing
 
-        # Re-index blocks to match the new layer positions (0 to num_hidden_layers_decoder-1)
+        # Re-index layer indices for attention caching
         for new_idx, block in enumerate(self.h):
             block.attn.layer_idx = new_idx
             if hasattr(block, 'crossattention'):
                 block.crossattention.layer_idx = new_idx
         return self
 
-    # @auto_docstring
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -751,12 +947,29 @@ class LanguageDecoder(LanguageDecoderBase):
         return_dict: Optional[bool] = None,
         return_segment: bool = True,
         **kwargs,
-    ) -> Union[tuple, CausalLMAutoencoderOutputWithCrossAttentions]:
+    ) -> Union[tuple, BaseAutoencoderOutputWithPastAndCrossAttentions]:
+        """
+        Forward pass for the language decoder.
+
+        Args:
+            inputs_latents: Shape (batch_size, num_segments, latent_dim)
+            inputs_embeds: Shape (batch_size, num_segments, hidden_size)
+            input_ids: Not used (warning emitted if provided)
+
+        Returns:
+            BaseAutoencoderOutputWithPastAndCrossAttentions
+        """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         if input_ids is not None:
-            warnings.warn("Decoder only processes inputs_latents and inputs_embeds but not input_ids")
-        pre_process_res: PreprocessOutput = self.pre_process_inputs(input_ids=input_ids, inputs_latents=inputs_latents, inputs_embeds=inputs_embeds)
+            warnings.warn("LanguageDecoder processes inputs_latents/inputs_embeds, not input_ids")
+
+        preprocessed = self.pre_process_inputs(
+            input_ids=input_ids,
+            inputs_latents=inputs_latents,
+            inputs_embeds=inputs_embeds
+        )
+
         output = super().forward(
             input_ids=None,
             past_key_values=past_key_values,
@@ -764,7 +977,7 @@ class LanguageDecoder(LanguageDecoderBase):
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
             position_ids=position_ids,
-            inputs_embeds=pre_process_res.inputs_embeds,
+            inputs_embeds=preprocessed.inputs_embeds,
             encoder_hidden_states=encoder_hidden_states,
             encoder_attention_mask=encoder_attention_mask,
             use_cache=use_cache,
@@ -775,59 +988,58 @@ class LanguageDecoder(LanguageDecoderBase):
         )
         return self.post_process_outputs(outputs=output)
 
+
 class LanguageDecoderLMHead(GPT2PreTrainedModel, GenerationMixin):
-    # _tied_weights_keys = {"lm_head.weight": "transformer.wte.weight"}
+    """
+    Language decoder with multi-head LM projection.
+
+    Uses `window_size` separate linear heads to project each decoder hidden state
+    to `window_size` vocabulary distributions.
+
+    Processing flow:
+        1. Decode latents: (batch_size, num_segments, hidden_size)
+        2. Apply window_size LM heads: each produces (batch_size, num_segments, vocab_size)
+        3. Interleave outputs: (batch_size, num_segments * window_size, vocab_size)
+    """
 
     def __init__(self, config: LatentGPT2Config):
         super().__init__(config)
         self.transformer = LanguageDecoder(config=config)
-        
-        # Single head projection mechanism
-        # self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        
-        # Multi-head projection mechanism using window_size heads
+
+        # Multi-head projection: each head predicts one position in the window
         self.multi_lm_head = nn.ModuleList([
-            nn.Linear(config.n_embd, config.vocab_size, bias=False) 
+            nn.Linear(config.n_embd, config.vocab_size, bias=False)
             for _ in range(config.window_size)
         ])
-
-        # Initialize weights and apply final processing
         self.post_init()
-        
-    def init_weight_from_pretrained(self, pretrained_model: GPT2LMHeadModel):
-        """
-        Initializes the language encoder from a pre-trained model.
 
-        Args:
-            pretrained_model: The pre-trained model to use.
-
-        Returns:
-            A new instance of the class.
-        """
-        self.transformer.init_weight_from_pretrained(pretrained_model=pretrained_model.transformer)
+    def init_weight_from_pretrained(self, pretrained_model: GPT2LMHeadModel) -> "LanguageDecoderLMHead":
+        """Initialize from pretrained GPT-2 LM model."""
+        self.transformer.init_weight_from_pretrained(pretrained_model.transformer)
+        # Deep copy the pretrained lm_head weights to each multi-head
         for i in range(len(self.multi_lm_head)):
             self.multi_lm_head[i] = copy.deepcopy(pretrained_model.lm_head)
         return self
 
-    def _project_with_multi_heads(self, latents: torch.Tensor) -> torch.Tensor:
+    def _project_with_multi_heads(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """
-        Project decoder hidden states to logits using multi-head mechanism.
-        
+        Project decoder hidden states to vocabulary logits using multi-head mechanism.
+
         Args:
-            latents: Shape (batch_size, sequence_length, hidden_size)
-        
+            hidden_states: Shape (batch_size, num_segments, hidden_size)
+
         Returns:
-            logits: Shape (batch_size, sequence_length * config.window_size, vocab_size)
+            logits: Shape (batch_size, num_segments * window_size, vocab_size)
         """
-        multi_head_logits: List[torch.Tensor] = []
-        for i in range(self.config.window_size):
-            multi_head_logits.append(self.multi_lm_head[i](latents))
+        # Each head predicts one token position within the window
+        # Head 0 predicts position 0, Head 1 predicts position 1, etc.
+        # This allows one latent to expand to window_size tokens
+        multi_head_logits = [head(hidden_states) for head in self.multi_lm_head]
+
+        # Interleave outputs: [head0_seg0, head1_seg0, ..., head0_seg1, head1_seg1, ...]
+        # to match original token ordering
         return self.transformer.ae_utils.flatten_multi_heads_logits(logits=multi_head_logits)
 
-    @auto_docstring(
-        custom_intro="Forward pass for the language decoder with LM head.",
-        checkpoint="GPT2PreTrainedModel",
-    )
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -848,23 +1060,28 @@ class LanguageDecoderLMHead(GPT2PreTrainedModel, GenerationMixin):
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs,
     ) -> Union[tuple, CausalLMAutoencoderOutputWithCrossAttentions]:
-        r"""
-        inputs_latents (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
-            Latent representations to be decoded. These are typically output from the encoder component of the
-            autoencoder and represent compressed semantic information to be expanded back into token sequences.
-        input_ids (`torch.LongTensor` of shape `(batch_size, input_ids_length)`):
-            LangaugeDeocder and LanuageDecoderLMHead don't process input_ides, please use input_latents instead.
-        labels (`torch.LongTensor` of shape `(batch_size, input_ids_length)`, *optional*):
-            Labels for language modeling. Note that the labels **are shifted** inside the model, i.e. you can set
-            `labels = input_ids` Indices are selected in `[-100, 0, ..., config.vocab_size]` All labels set to `-100`
-            are ignored (masked), the loss is only computed for labels in `[0, ..., config.vocab_size]`
+        """
+        Forward pass for decoder with multi-head LM projection.
+
+        Args:
+            inputs_latents: Shape (batch_size, num_segments, latent_dim)
+            inputs_embeds: Shape (batch_size, num_segments, hidden_size)
+            logits_to_keep: Number of final positions to keep (0 = all)
+
+        Returns:
+            CausalLMAutoencoderOutputWithCrossAttentions with:
+            - logits: (batch_size, num_segments * window_size, vocab_size)
+            - latents: Input latents
+            - latent_embeds: Projected latent embeddings
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        
+
+        # Compute latent embeddings if needed
+        latent_embeds = None
         if inputs_latents is not None and inputs_embeds is None:
-            inferred_inputs_embeds = self.transformer.wte_latent(inputs_latents)
+            latent_embeds = self.transformer.wte_latent(inputs_latents)
         else:
-            inferred_inputs_embeds = inputs_embeds
+            latent_embeds = inputs_embeds
 
         transformer_outputs = self.transformer(
             input_ids=input_ids,
@@ -882,57 +1099,66 @@ class LanguageDecoderLMHead(GPT2PreTrainedModel, GenerationMixin):
             output_hidden_states=True,
             return_dict=True,
         )
-        latents = transformer_outputs.last_tail_hidden_state
 
+        hidden_states = transformer_outputs.last_tail_hidden_state
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        # logits = self.lm_head(latents[:, slice_indices, :])
-        logits = self._project_with_multi_heads(latents[:, slice_indices, :])
-
-        loss = None
+        logits = self._project_with_multi_heads(hidden_states[:, slice_indices, :])
 
         if not return_dict:
             output = (logits,) + transformer_outputs[1:]
-            return ((loss,) + output) if loss is not None else output
+            return output
 
         return CausalLMAutoencoderOutputWithCrossAttentions(
             last_tail_hidden_state=transformer_outputs.last_tail_hidden_state if output_hidden_states else None,
             last_window_hidden_state=transformer_outputs.last_window_hidden_state if output_hidden_states else None,
             last_hidden_state=transformer_outputs.last_hidden_state if output_hidden_states else None,
-            loss=loss,
+            loss=None,
             logits=logits,
             past_key_values=transformer_outputs.past_key_values,
             hidden_states=transformer_outputs.hidden_states if output_hidden_states else None,
             attentions=transformer_outputs.attentions,
             cross_attentions=transformer_outputs.cross_attentions,
-            latent_embeds=inferred_inputs_embeds,
+            latent_embeds=latent_embeds,
             latents=inputs_latents,
         )
 
+
+# =============================================================================
+# Full Autoencoder
+# =============================================================================
+
+
 class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
+    """
+    Complete language autoencoder combining encoder and decoder.
+
+    Architecture:
+        - Encoder: LanguageEncoderLatentHead (text -> latents)
+        - Decoder: LanguageDecoderLMHead (latents -> text)
+
+    Full processing flow:
+        1. Encoder: (batch_size, seq_len) -> (batch_size, num_segments, latent_dim)
+        2. Decoder: (batch_size, num_segments, latent_dim) -> (batch_size, padded_seq_len, vocab_size)
+
+    Note: padded_seq_len = ceil(seq_len / window_size) * window_size
+    """
+
+    # Tie encoder's latent projection to decoder's latent-to-hidden projection
+    # This ensures the latent space is shared between encoder and decoder
     _tied_weights_keys = {"encoder.latent_head.weight": "decoder.transformer.wte_latent.weight"}
+
     def __init__(self, config: LatentGPT2Config):
         super().__init__(config)
-        # self.window_size: int = window_size
-        self.encoder: LanguageEncoderLatentHead = LanguageEncoderLatentHead(config=config)
-        self.decoder: LanguageDecoderLMHead = LanguageDecoderLMHead(config=config)
-        
-        # Initialize weights and apply final processing
+        self.encoder = LanguageEncoderLatentHead(config=config)
+        self.decoder = LanguageDecoderLMHead(config=config)
         self.post_init()
 
-    def init_weight_from_pretrained(self, pretrained_model: GPT2LMHeadModel):
-        """
-        Initializes the language encoder from a pre-trained model.
-
-        Args:
-            pretrained_model: The pre-trained model to use.
-
-        Returns:
-            A new instance of the class.
-        """
-        self.encoder.init_weight_from_pretrained(pretrained_model=pretrained_model)
-        self.decoder.init_weight_from_pretrained(pretrained_model=pretrained_model)
+    def init_weight_from_pretrained(self, pretrained_model: GPT2LMHeadModel) -> "LanguageAutoencoder":
+        """Initialize both encoder and decoder from pretrained GPT-2 LM model."""
+        self.encoder.init_weight_from_pretrained(pretrained_model)
+        self.decoder.init_weight_from_pretrained(pretrained_model)
         return self
-    
+
     def encode(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -952,9 +1178,18 @@ class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs,
     ) -> Union[tuple, CausalLMAutoencoderOutputWithCrossAttentions]:
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        """
+        Encode input text to latent representations.
 
-        encoder_output = self.encoder(
+        Args:
+            input_ids: Shape (batch_size, seq_len)
+
+        Returns:
+            CausalLMAutoencoderOutputWithCrossAttentions with latents shape
+            (batch_size, num_segments, latent_dim)
+        """
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return self.encoder(
             input_ids=input_ids,
             past_key_values=past_key_values,
             cache_position=cache_position,
@@ -972,8 +1207,7 @@ class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
             logits_to_keep=logits_to_keep,
             **kwargs,
         )
-        return encoder_output
-    
+
     def decode(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -994,9 +1228,18 @@ class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs,
     ) -> Union[tuple, CausalLMAutoencoderOutputWithCrossAttentions]:
+        """
+        Decode latent representations to vocabulary logits.
+
+        Args:
+            inputs_latents: Shape (batch_size, num_segments, latent_dim)
+
+        Returns:
+            CausalLMAutoencoderOutputWithCrossAttentions with logits shape
+            (batch_size, num_segments * window_size, vocab_size)
+        """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        
-        decoder_output = self.decoder(
+        return self.decoder(
             input_ids=input_ids,
             inputs_latents=inputs_latents,
             past_key_values=past_key_values,
@@ -1015,14 +1258,14 @@ class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
             logits_to_keep=logits_to_keep,
             **kwargs,
         )
-        return decoder_output
 
     def _format_dict_output(
         self,
-        dict_output,
+        dict_output: CausalLMAutoencoderOutputWithCrossAttentions,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
     ) -> CausalLMAutoencoderOutputWithCrossAttentions:
+        """Format output based on requested hidden states and attentions."""
         return CausalLMAutoencoderOutputWithCrossAttentions(
             last_tail_hidden_state=dict_output.last_tail_hidden_state if output_hidden_states else None,
             last_window_hidden_state=dict_output.last_window_hidden_state if output_hidden_states else None,
@@ -1056,8 +1299,27 @@ class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
         return_encoder_decoder_res: bool = False,
         **kwargs,
     ) -> Union[tuple, CausalLMAutoencoderOutputWithCrossAttentions]:
+        """
+        Full forward pass: encode input text and decode back to vocabulary logits.
+
+        Args:
+            input_ids: Shape (batch_size, seq_len)
+            labels: Shape (batch_size, seq_len) - for computing reconstruction loss
+            return_encoder_decoder_res: If True, returns (ae_output, encoder_output, decoder_output)
+
+        Returns:
+            CausalLMAutoencoderOutputWithCrossAttentions with:
+            - logits: (batch_size, padded_seq_len, vocab_size)
+            - latents: (batch_size, num_segments, hidden_size)
+            - loss: Reconstruction loss (if labels provided)
+        """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        # =====================================================================
+        # ENCODING PHASE
+        # Input: (batch_size, seq_len) -> Output: (batch_size, num_segments, latent_dim)
+        # Compresses window_size tokens into 1 latent vector per segment
+        # =====================================================================
         encoder_output = self.encode(
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
@@ -1070,14 +1332,19 @@ class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
             encoder_attention_mask=None,
             use_cache=use_cache,
             output_attentions=output_attentions,
-            output_hidden_states=True,
+            output_hidden_states=True,  # Need hidden states for latent extraction
             return_dict=True,
-            logits_to_keep=0,
+            logits_to_keep=0,  # Keep all latents
         )
-        # hidden_states = encoder_output[0]
+
+        # =====================================================================
+        # DECODING PHASE
+        # Input: (batch_size, num_segments, latent_dim) -> Output: (batch_size, padded_seq_len, vocab_size)
+        # Expands 1 latent vector into window_size token predictions per segment
+        # =====================================================================
         decoder_output = self.decode(
-            input_ids=None,
-            inputs_latents=encoder_output.latents,
+            input_ids=None,  # Decoder uses latents, not token IDs
+            inputs_latents=encoder_output.latents,  # Latents from encoder
             past_key_values=None,
             attention_mask=None,
             cache_position=None,
@@ -1090,19 +1357,21 @@ class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
             output_attentions=output_attentions,
             output_hidden_states=True,
             return_dict=True,
-            logits_to_keep=0,
+            logits_to_keep=0,  # Keep all positions
         )
 
+        # Apply logits_to_keep slicing (0 means keep all)
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = decoder_output.logits[:, slice_indices, :]
-        # print(f"decoder_output.logits: {decoder_output.logits.shape}")
-        # print(f"logits: {logits.shape}")
 
+        # =====================================================================
+        # LOSS COMPUTATION (if labels provided)
+        # Labels must be padded to match logits length (multiple of window_size)
+        # =====================================================================
         loss = None
         if labels is not None:
-            # Pad labels to make it can be divided by self.config.window_size
-            padded_labels: torch.LongTensor = self.decoder.transformer.ae_utils.pad(sequence=labels)
-            # Flatten the tokens
+            # Pad labels to match the padded sequence length from decoder
+            padded_labels = self.decoder.transformer.ae_utils.pad(sequence=labels)
             loss = self.loss_function(
                 logits=logits,
                 labels=padded_labels,
@@ -1126,17 +1395,18 @@ class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
             cross_attentions=decoder_output.cross_attentions if output_attentions else None,
             latents=encoder_output.last_tail_hidden_state,
         )
-        # Handle encoder and decoder dict output format
-        encoder_output = self._format_dict_output(dict_output=encoder_output, output_attentions=output_attentions, output_hidden_states=output_hidden_states)
-        decoder_output = self._format_dict_output(dict_output=decoder_output, output_attentions=output_attentions, output_hidden_states=output_hidden_states)
-        
-        # When return_encoder_decoder_res=True, return tuple of (ar_outputs, ltar_output, encoder_output)
+
         if return_encoder_decoder_res:
-            # ltar_output is the latent AR prediction (placeholder: using encoder_output for now)
-            # encoder_output contains the actual encoder latents
+            encoder_output = self._format_dict_output(
+                encoder_output, output_attentions, output_hidden_states
+            )
+            decoder_output = self._format_dict_output(
+                decoder_output, output_attentions, output_hidden_states
+            )
             return (ae_output, encoder_output, decoder_output)
+
         return ae_output
-    
+
     def _loss_function(
         self,
         logits: torch.FloatTensor,
@@ -1147,46 +1417,66 @@ class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
         ignore_index: int = -100,
         **kwargs,
     ) -> torch.FloatTensor:
-        # Copy from LTLMTrainer.compute_smoothed_loss
-        # Either do not shift, for reconstruction, or shift by the window_size
+        """
+        Compute label-smoothed cross-entropy loss for reconstruction.
+
+        Args:
+            logits: Shape (batch_size, seq_len, vocab_size)
+            labels: Shape (batch_size, seq_len)
+            vocab_size: Size of vocabulary
+            shift_labels: Number of positions to shift labels (0 for reconstruction)
+            epsilon: Label smoothing factor
+            ignore_index: Index to ignore in loss computation
+
+        Returns:
+            Scalar loss tensor
+        """
+        # Optionally shift labels for next-token prediction (shift_labels=1)
+        # For reconstruction (shift_labels=0), logits and labels align directly
         if shift_labels:
             logits = logits[..., :-shift_labels, :].contiguous()
             labels = labels[..., shift_labels:].contiguous()
 
-        # Claude Code update, double check, Ensure logits and labels have the same sequence length
-        # I've added a padding function for labels, making logits and labels have the same length. Labels sometimes cannot be devided by the self.config.window_size
-        # logits_seq_len = logits.size(-2)
-        # labels_seq_len = labels.size(-1)
-        # if logits_seq_len != labels_seq_len:
-        #     min_len = min(logits_seq_len, labels_seq_len)
-        #     logits = logits[..., :min_len, :].contiguous()
-        #     labels = labels[..., :min_len].contiguous()
-        # Claude Code update ends
-
+        # Compute negative log probabilities for all vocab tokens
         log_probs = -nn.functional.log_softmax(logits, dim=-1)
+
+        # Ensure labels have shape (batch, seq_len, 1) for gather operation
         if labels.dim() == log_probs.dim() - 1:
             labels = labels.unsqueeze(-1)
 
+        # Create mask for padding/ignored positions
         padding_mask = labels.eq(ignore_index)
-        # In case the ignore_index is -100, the gather will fail, so we replace labels by 0. The padding_mask
-        # will ignore them in any case.
+
+        # Clamp negative indices to 0 to avoid gather errors (masked out anyway)
         labels = torch.clamp(labels, min=0)
-        # print(f"log_probs: {log_probs.shape}, labels: {labels.shape}")
+
+        # NLL loss: gather the log prob of the correct token at each position
         nll_loss = log_probs.gather(dim=-1, index=labels)
-        # works for fp16 input tensor too, by internally upcasting it to fp32
+
+        # Smoothed loss: sum of all log probs (uniform distribution component)
+        # Use float32 for numerical stability in the sum
         smoothed_loss = log_probs.sum(dim=-1, keepdim=True, dtype=torch.float32)
 
+        # Zero out loss for padded positions
         nll_loss.masked_fill_(padding_mask, 0.0)
         smoothed_loss.masked_fill_(padding_mask, 0.0)
 
-        # Take the mean over the label dimensions, then divide by the number of active elements (i.e. not-padded):
-        num_active_elements = padding_mask.numel() - padding_mask.long().sum()
-        nll_loss = nll_loss.sum() / num_active_elements
-        smoothed_loss = smoothed_loss.sum() / (num_active_elements * log_probs.shape[-1])
+        # Average over non-padded positions only
+        num_active = padding_mask.numel() - padding_mask.long().sum()
+        nll_loss = nll_loss.sum() / num_active
+        smoothed_loss = smoothed_loss.sum() / (num_active * log_probs.shape[-1])
+
+        # Label smoothing: interpolate between NLL and uniform distribution
+        # epsilon=0.1 means 90% weight on correct token, 10% spread uniformly
         return (1 - epsilon) * nll_loss + epsilon * smoothed_loss
+
 
 __all__ = [
     "LanguageAutoencoder",
     "LanguageDecoderLMHead",
     "LanguageEncoderLatentHead",
+    "LanguageEncoder",
+    "LanguageDecoder",
+    "LanguageEncoderUtils",
+    "LanguageDecoderUtils",
 ]
