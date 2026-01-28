@@ -663,6 +663,9 @@ class LanguageFlowMatching(GPT2PreTrainedModel, GenerationMixin):
         logits = transformer_outputs.last_hidden_state[:, -1:, ...]
         if return_trajectories:
             trajectories = logits.unsqueeze(1)
+        # print(f"LanguageFlowMatching - inputs_prev_latent: {inputs_prev_latent.shape}")
+        # print(f"LanguageFlowMatching - inputs_latent_timestep: {inputs_latent_timestep.shape}")
+        # print(f"LanguageFlowMatching - logits: {logits.shape}")
         estimates = inputs_prev_latent - (inputs_latent_timestep - 1.0) * logits
         # last_context = transformer_outputs.last_hidden_state[:, :-1, ...]
         # contexts = (s[:, :-1, ...] for s in transformer_outputs.hidden_states)
@@ -721,15 +724,15 @@ class LanguageFlowMatching(GPT2PreTrainedModel, GenerationMixin):
             # Training mode
             if inputs_latent_timestep is None and inputs_prev_latent is None:
                 # If both inputs_latent_timestep and inputs_prev_latent are not provided, random sample
-                inputs_latent_timestep = torch.rand(labels.shape[0], 1, device=labels.device)
+                # CAUTION: Expand timestep for broadcasting: (batch_size,) -> (batch_size, 1, 1) for (batch_size, seq_len, hidden_dim), if not, the dimension of inputs_prev_latent will be wrong
+                inputs_latent_timestep = torch.rand(labels.shape[0], 1, 1, device=labels.device)
                 noise = self.transformer._rand_latent(batch_size=labels.shape[0], device=labels.device)
-                # Expand timestep for broadcasting: (batch_size,) -> (batch_size, 1, 1) for (batch_size, seq_len, hidden_dim)
-                t_expanded = inputs_latent_timestep.view(-1, 1, 1)
-                inputs_prev_latent = t_expanded * labels + (1.0 - t_expanded) * noise
+                inputs_prev_latent = inputs_latent_timestep * labels + (1.0 - inputs_latent_timestep) * noise
             elif inputs_latent_timestep is not None and inputs_prev_latent is not None:
                 # If both inputs_latent_timestep and inputs_prev_latent are provided, use it for training
-                t_expanded = inputs_latent_timestep.view(-1, 1, 1)
-                noise = (inputs_prev_latent - t_expanded * labels) /  (1.0 - t_expanded)
+                # CAUTION: Expand timestep for broadcasting: (batch_size,) -> (batch_size, 1, 1) for (batch_size, seq_len, hidden_dim), if not, the dimension of inputs_prev_latent will be wrong
+                inputs_latent_timestep = inputs_latent_timestep.view(-1, 1, 1)
+                noise = (inputs_prev_latent - inputs_latent_timestep * labels) /  (1.0 - inputs_latent_timestep)
             else:
                 raise ValueError("Arguements inputs_prev_latent and inputs_latent_timestep should be both provided or not provided.")
             velocity = labels - noise
@@ -738,19 +741,16 @@ class LanguageFlowMatching(GPT2PreTrainedModel, GenerationMixin):
             velocity = None
             if inputs_embeds is None:
                 raise ValueError("If labels is missing, inputs_embeds is required, but inputs_embeds is missing.")
-            # if inputs_prev_latent is None:
-            #     raise ValueError("If labels is missing, inputs_prev_latent, inputs_latent_timestep, and inputs_embeds are required, but inputs_prev_latent is missing.")
-            # if inputs_latent_timestep is None:
-            #     raise ValueError("If labels is missing, inputs_prev_latent, inputs_latent_timestep, and inputs_embeds are required, but inputs_latent_timestep is missing.")
 
             if inputs_prev_latent is None and inputs_latent_timestep is None:
-                inputs_latent_timestep = torch.rand(inputs_embeds.shape[0], 1, device=inputs_embeds.device)
+                # CAUTION: Expand timestep for broadcasting: (batch_size,) -> (batch_size, 1, 1) for (batch_size, seq_len, hidden_dim), if not, the dimension of inputs_prev_latent will be wrong
+                inputs_latent_timestep = torch.rand(inputs_embeds.shape[0], 1, 1, device=inputs_embeds.device)
                 inputs_prev_latent = self.transformer._rand_latent(batch_size=inputs_embeds.shape[0], device=inputs_embeds.device)
-                return inputs_prev_latent, inputs_latent_timestep, velocity
             elif inputs_prev_latent is not None and inputs_latent_timestep is not None:
-                return inputs_prev_latent, inputs_latent_timestep, velocity
+                pass
             else:
                 raise ValueError("If labels is missing, inputs_prev_latent and inputs_latent_timestep shoule be provided simultaneously or neither, but only one of them is provided.")
+        return inputs_prev_latent, inputs_latent_timestep, velocity
     
     def _simple_model_call(
         self,

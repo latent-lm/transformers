@@ -170,12 +170,14 @@ class LatnetAutoregressive(GPT2PreTrainedModel, GenerationMixin):
         
         decoder_output = self.autoencoder.decode(
             input_ids=None,
+            # CAUTION: Pass latent into inputs_latents, not inputs_embeds
+            inputs_latents=fm_output.estimates,
             past_key_values=None,
             cache_position=None,
             attention_mask=None,
             token_type_ids=None,
             position_ids=None,
-            inputs_embeds=fm_output.estimates,
+            inputs_embeds=None,
             encoder_hidden_states=None,
             encoder_attention_mask=None,
             labels=labels_target,
@@ -199,7 +201,7 @@ class LatnetAutoregressive(GPT2PreTrainedModel, GenerationMixin):
                 labels=labels_target,
                 vocab_size=self.config.vocab_size,
                 **kwargs,
-            ) + fm_output.loss + ae_output.loss
+            ) + ae_output.loss
 
         latent_lm_output = LatentCausalLMOutputWithCrossAttentions(
             last_tail_hidden_state=decoder_output.last_tail_hidden_state if output_hidden_states else None,
@@ -306,12 +308,14 @@ class LatnetAutoregressive(GPT2PreTrainedModel, GenerationMixin):
         # with torch.no_grad():
         decoder_output = self.autoencoder.decode(
             input_ids=None,
+            # CAUTION: Pass latent into inputs_latents, not inputs_embeds
+            inputs_latents=fm_output.estimates,
             past_key_values=None,
             cache_position=None,
             attention_mask=None,
             token_type_ids=None,
             position_ids=None,
-            inputs_embeds=fm_output.estimates,
+            inputs_embeds=None,
             encoder_hidden_states=None,
             encoder_attention_mask=None,
             labels=None,
@@ -413,10 +417,11 @@ class LatnetAutoregressive(GPT2PreTrainedModel, GenerationMixin):
             return_dict=True,
             logits_to_keep=0,
         )
+        # print(f"encoder_output.latents: {encoder_output.latents.shape}")
 
         fm_output = self.fm(
-            inputs_prev_latent=None,
-            inputs_latent_timestep=None,
+            inputs_prev_latent=inputs_prev_latent,
+            inputs_latent_timestep=inputs_latent_timestep,
             input_ids=None,
             past_key_values=None,
             cache_position=None,
@@ -433,16 +438,20 @@ class LatnetAutoregressive(GPT2PreTrainedModel, GenerationMixin):
             return_dict=True,
             logits_to_keep=0,
         )
+        # print(f"fm_output.logits: {fm_output.logits.shape}")
+        # print(f"fm_output.estimates: {fm_output.estimates.shape}")
 
         # with torch.no_grad():
         decoder_output = self.autoencoder.decode(
             input_ids=None,
+            # CAUTION: Pass latent into inputs_latents, not inputs_embeds
+            inputs_latents=fm_output.estimates,
             past_key_values=None,
             cache_position=None,
             attention_mask=None,
             token_type_ids=None,
             position_ids=None,
-            inputs_embeds=fm_output.estimates,
+            inputs_embeds=None,
             encoder_hidden_states=None,
             encoder_attention_mask=None,
             labels=None,
@@ -452,6 +461,7 @@ class LatnetAutoregressive(GPT2PreTrainedModel, GenerationMixin):
             return_dict=True,
             logits_to_keep=0,
         )
+        # print(f"decoder_output.logits: {decoder_output.logits.shape}")
 
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         # logits = self.lm_head(decoder_output.hidden_states[:, slice_indices, :])
@@ -483,6 +493,8 @@ class LatnetAutoregressive(GPT2PreTrainedModel, GenerationMixin):
         # Recover the trainable state
         if is_autoencoder_training:
             self.autoencoder = self.autoencoder.train()
+        
+        # print(f"LatentAutoregressive logits: {logits.shape}")
 
         if not return_dict:
             output = (logits,) + decoder_output[1:]
