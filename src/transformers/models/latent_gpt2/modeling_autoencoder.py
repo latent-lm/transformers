@@ -95,7 +95,26 @@ class LanguageDecoderBase(GPT2ModelBase):
                 self.wte_latent.weight.copy_(torch.eye(self.embed_dim))
 
 class SequenceWindowUtilsBase:
-    """Base class for sequence windowing utilities with shared properties and padding methods."""
+    """
+    Base class for sequence windowing utilities with shared properties and padding methods.
+    
+    Key Concept - segment_num:
+    ===========================
+    segment_num represents the number of segments (windows) created after dividing a sequence 
+    into fixed-size chunks. It is computed as:
+    
+    segment_num = ceil(seq_len / window_size)
+    
+    This means:
+    - If seq_len = 100, window_size = 4 → segment_num = ceil(100/4) = 25
+    - If seq_len = 99, window_size = 4 → segment_num = ceil(99/4) = 25 (with 1 padding)
+    - After padding: padded_seq_len = segment_num * window_size
+    
+    The sequences are reshaped from:
+    - Input: (batch_size, seq_len, ...)
+    - After aggregation: (batch_size * segment_num, window_size, ...)
+    - After splitting: (batch_size, segment_num * window_size, ...)
+    """
     TOKEN_TYPE_PADDING: str = "padding"
     TOKEN_TYPE_MASKING: str = "masking"
     SUPPORTED_TOKEN_TYPES: List[str] = [
@@ -114,6 +133,8 @@ class SequenceWindowUtilsBase:
     ):
         self._batch_size: int = None
         self._seq_len: int = None
+        # segment_num: Number of segments after dividing sequence into fixed-size windows
+        # See class docstring for detailed explanation of computation and usage
         self._segment_num: int = None
         self._window_size: int = window_size
         self._padding_token = padding_token
@@ -142,7 +163,7 @@ class SequenceWindowUtilsBase:
         if self._padding_embed is None:
             if self._wte is None:
                 raise ValueError("To get padding_embed, either provide padding_embed or wte")
-            self._padding_embed = self._wte(self._padding_token)
+            self._padding_embed = self._wte(torch.tensor([self._padding_token]))
         return self._padding_embed
 
     def _get_padding_token(self) -> torch.LongTensor:
@@ -154,7 +175,7 @@ class SequenceWindowUtilsBase:
         if self._masking_embed is None:
             if self._wte is None:
                 raise ValueError("To get masking_embed, either provide masking_embed or wte")
-            self._masking_embed = self._wte(self._masking_token)
+            self._masking_embed = self._wte(torch.tensor([self._masking_token]))
         return self._masking_embed
 
     def _get_masking_token(self) -> torch.LongTensor:
@@ -162,7 +183,7 @@ class SequenceWindowUtilsBase:
             raise ValueError("masking_token is not set")
         return self._masking_token
     
-    def _get_used_token(self, token_type: str):
+    def _get_token(self, token_type: str):
         if token_type == SequenceWindowUtilsBase.TOKEN_TYPE_PADDING:
             return self._get_padding_token()
         elif token_type == SequenceWindowUtilsBase.TOKEN_TYPE_MASKING:
@@ -170,7 +191,7 @@ class SequenceWindowUtilsBase:
         else:
             raise ValueError(f"token_type, {token_type}, isn't supported, only support {SequenceWindowUtilsBase.SUPPORTED_TOKEN_TYPES}")
         
-    def _get_used_embed(self, token_type: str):
+    def _get_embed(self, token_type: str):
         if token_type == SequenceWindowUtilsBase.TOKEN_TYPE_PADDING:
             return self._get_padding_embed()
         elif token_type == SequenceWindowUtilsBase.TOKEN_TYPE_MASKING:
@@ -178,19 +199,33 @@ class SequenceWindowUtilsBase:
         else:
             raise ValueError(f"token_type, {token_type}, isn't supported, only support {SequenceWindowUtilsBase.SUPPORTED_TOKEN_TYPES}")
 
-    def pad(self, sequence: Optional[torch.Tensor] = None, token_type: str = "padding") -> torch.Tensor:
+    def _pad(self, token_type: str, sequence: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Pad the given sequence to be a multiple of window_size.
 
-        If sequence is None, return None.
-        For 2D sequence (batch_size, seq_len), pad with padding_token.
-        For 3D sequence (batch_size, seq_len, embedding_size), pad with padding_embed.
+        The padded_seq_len is calculated as the smallest multiple of window_size that is 
+        greater than or equal to the input seq_len. Specifically:
+        `padded_seq_len = seq_len + pad_len` where 
+        `pad_len = (window_size - (seq_len % window_size)) % window_size`
+
+        Args:
+            token_type (`str`):
+                Type of padding to use. Should be one of `"padding"` or `"masking"`.
+            sequence (`torch.Tensor` of shape `(batch_size, seq_len)` or `(batch_size, seq_len, hidden_size)`, *optional*):
+                Input sequence to pad. For 2D tensors, pad with token IDs. For 3D tensors, pad with embeddings.
 
         Returns:
-            torch.Tensor: Padded sequence with length divisible by window_size.
+            `torch.Tensor`:
+                Padded sequence with shape `(batch_size, padded_seq_len)` for 2D input or 
+                `(batch_size, padded_seq_len, hidden_size)` for 3D input, where 
+                `padded_seq_len` is the smallest multiple of `window_size` >= `seq_len`.
+                Returns `None` if input sequence is `None`.
         """
         if sequence is None:
             return sequence
+        if self._window_size == 0:
+            return sequence
+
         batch_size: int = sequence.shape[0]
         seq_len: int = sequence.shape[1]
         pad_len: int = (self._window_size - (seq_len % self._window_size)) % self._window_size
@@ -199,19 +234,32 @@ class SequenceWindowUtilsBase:
             return sequence
 
         if sequence.dim() == 2:
-            pad = torch.full((batch_size, pad_len), self._get_used_token(token_type=token_type),
+            pad = torch.full((batch_size, pad_len), self._get_token(token_type=token_type),
                            dtype=sequence.dtype, device=sequence.device)
         elif sequence.dim() == 3:
-            pad = self._get_used_embed(token_type=token_type).expand(batch_size, pad_len, -1).to(
+            pad = self._get_embed(token_type=token_type).reshape(1, 1, -1).expand(batch_size, pad_len, -1).to(
                 dtype=sequence.dtype, device=sequence.device)
         else:
             raise NotImplementedError(f"Unsupported input dimension: {sequence.dim()} with shape {sequence.shape}")
         return torch.cat((sequence, pad), dim=1)
 
     def split_sequence(self, sequence: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Split a windowed sequence back to batch dimensions."""
+        """
+        Split a windowed sequence back to batch dimensions.
+
+        Args:
+            sequence (`torch.Tensor` of shape `(batch_size * segment_num, window_size, ...)`, *optional*):
+                Input sequence in windowed format to reshape back to batch dimensions.
+
+        Returns:
+            `torch.Tensor`:
+                Reshaped sequence with shape `(batch_size, segment_num * window_size, ...)`.
+                Returns `None` if input sequence is `None`.
+        """
         if sequence is None:
             return sequence
+        # Reshape from (batch_size * segment_num, window_size, ...) back to (batch_size, segment_num * window_size, ...)
+        # segment_num was computed as ceil(original_seq_len / window_size) during aggregation
         return sequence.reshape(self._batch_size, self._segment_num * sequence.shape[1], *sequence.shape[2:])
     
     def split_context_target(
@@ -219,18 +267,40 @@ class SequenceWindowUtilsBase:
         sequence: torch.Tensor,
         is_padding: bool = True,
     ) -> Tuple[torch.Tensor]:
+        """
+        Split sequence into context and target parts.
+
+        Args:
+            sequence (`torch.Tensor` of shape `(batch_size, seq_len)` or `(batch_size, seq_len, hidden_size)`, *optional*):
+                Input sequence to split. The last `window_size` elements become the target,
+                and the rest becomes the context.
+            is_padding (`bool`, *optional*, defaults to `True`):
+                Whether to pad the context to be divisible by window_size.
+
+        Returns:
+            `Tuple[torch.Tensor]`:
+                - context: Context part with shape `(batch_size, seq_len - window_size)` or 
+                  `(batch_size, seq_len - window_size, hidden_size)`. If `is_padding=True`, 
+                  may be padded to `(batch_size, padded_len)` or `(batch_size, padded_len, hidden_size)`.
+                - target: Target part with shape `(batch_size, window_size)` or 
+                  `(batch_size, window_size, hidden_size)`.
+        """
         if sequence is None:
             return None
         if sequence.dim() == 2:
             context: torch.Tensor = sequence[..., :-self._window_size].contiguous()
             target: torch.Tensor = sequence[..., -self._window_size:].contiguous()
             if is_padding:
-                context: torch.Tensor = self.pad(sequence=context)
+                context: torch.Tensor = self._pad(
+                    sequence=context, token_type=SequenceWindowUtilsBase.TOKEN_TYPE_PADDING
+                )
         elif sequence.dim() > 2:
             context: torch.Tensor = sequence[..., :-self._window_size, :].contiguous()
             target: torch.Tensor = sequence[..., -self._window_size:, :].contiguous()
             if is_padding:
-                context: torch.Tensor = self.pad(sequence=context)
+                context: torch.Tensor = self._pad(
+                    sequence=context, token_type=SequenceWindowUtilsBase.TOKEN_TYPE_PADDING
+                )
         else:
             raise NotImplementedError(f"Unsupported input dimension: {sequence.dim()} with shape {sequence.shape}")
         return context, target
@@ -241,6 +311,32 @@ class SequenceWindowUtilsBase:
         is_padding: bool = True,
         return_context_target: bool = False,
     ) -> Tuple[torch.Tensor]:
+        """
+        Split sequence into context and target, then concatenate them back.
+
+        This method splits the input sequence and then concatenates the parts back together,
+        potentially with padding applied to the context part.
+
+        Args:
+            sequence (`torch.Tensor` of shape `(batch_size, seq_len)` or `(batch_size, seq_len, hidden_size)`, *optional*):
+                Input sequence to process.
+            is_padding (`bool`, *optional*, defaults to `True`):
+                Whether to pad the context to be divisible by window_size.
+            return_context_target (`bool`, *optional*, defaults to `False`):
+                Whether to return the individual context and target parts.
+
+        Returns:
+            `torch.Tensor` or `Tuple[torch.Tensor]`:
+                If `return_context_target=False`: 
+                - joint_seq: Concatenated sequence with shape `(batch_size, context_len + window_size)` 
+                  or `(batch_size, context_len + window_size, hidden_size)`.
+                If `return_context_target=True`:
+                - joint_seq: Concatenated sequence with same shape as above.
+                - context: Context part with shape `(batch_size, context_len)` or 
+                  `(batch_size, context_len, hidden_size)`.
+                - target: Target part with shape `(batch_size, window_size)` or 
+                  `(batch_size, window_size, hidden_size)`.
+        """
         if sequence is None:
             if return_context_target:
                 return None, None, None
@@ -274,7 +370,9 @@ class LanguageEncoderUtils(SequenceWindowUtilsBase):
             return sequence
         self._batch_size = sequence.shape[0]
         self._seq_len = sequence.shape[1]
-        padded_sequence = self.pad(sequence=sequence, token_type=SequenceWindowUtilsBase.TOKEN_TYPE_PADDING)
+        padded_sequence = self._pad(sequence=sequence, token_type=SequenceWindowUtilsBase.TOKEN_TYPE_PADDING)
+        # segment_num = ceil(seq_len / window_size) after padding
+        # Since padded_sequence is divisible by window_size, this gives the exact segment count
         self._segment_num = padded_sequence.shape[1] // self._window_size
         return padded_sequence.view(self._batch_size * self._segment_num, self._window_size, *padded_sequence.shape[2:])
 
@@ -297,6 +395,8 @@ class LanguageDecoderUtils(SequenceWindowUtilsBase):
             return sequence
         self._batch_size = sequence.shape[0]
         self._seq_len = sequence.shape[1]
+        # For single-element aggregation: segment_num = seq_len (each element is a segment)
+        # This means each input position becomes its own segment of size 1
         self._segment_num = sequence.shape[1]
         return sequence.view(self._batch_size * self._segment_num, 1, *sequence.shape[2:])
 
@@ -319,7 +419,9 @@ class LanguageDecoderUtils(SequenceWindowUtilsBase):
             return sequence
         self._batch_size = sequence.shape[0]
         self._seq_len = sequence.shape[1]
-        padded_sequence = self.pad(sequence=sequence, token_type=token_type)
+        padded_sequence = self._pad(sequence=sequence, token_type=token_type)
+        # segment_num = ceil(seq_len / window_size) after padding
+        # Since padded_sequence is divisible by window_size, this gives the exact segment count
         self._segment_num = padded_sequence.shape[1] // self._window_size
         return padded_sequence.view(self._batch_size * self._segment_num, self._window_size, *padded_sequence.shape[2:])
 
@@ -361,6 +463,9 @@ class LanguageDecoderUtils(SequenceWindowUtilsBase):
         Returns:
             Flattened logits with shape (batch_size, segment_num * window_size, vocab_size).
         """
+        # Flatten from multiple heads to single sequence
+        # Final shape: (batch_size, segment_num * window_size, vocab_size)
+        # where segment_num = ceil(original_seq_len / window_size)
         flatten_seq_shape = (self._batch_size, self._segment_num * self._window_size, *logits[0].shape[2:])
         return torch.stack(logits, dim=2).view(flatten_seq_shape)
     
@@ -375,7 +480,7 @@ class LanguageDecoderUtils(SequenceWindowUtilsBase):
         Returns:
             torch.Tensor: Padded sequence with length divisible by window_size.
         """
-        return super().pad(sequence=sequence, token_type=SequenceWindowUtilsBase.TOKEN_TYPE_PADDING)
+        return super()._pad(sequence=sequence, token_type=SequenceWindowUtilsBase.TOKEN_TYPE_PADDING)
 
 @auto_docstring(
     custom_intro="Language encoder model based on GPT-2 for encoding text into latent representations.",
@@ -464,9 +569,6 @@ class LanguageEncoder(LanguageEncoderBase):
                 block.crossattention.layer_idx = new_idx
         return self
 
-    @auto_docstring(
-        custom_args="return_segment (`bool`, *optional*, defaults to `True`): Whether to return segmented outputs.",
-    )
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -482,9 +584,57 @@ class LanguageEncoder(LanguageEncoderBase):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        return_segment: bool = True,
         **kwargs,
     ) -> Union[tuple, BaseAutoencoderOutputWithPastAndCrossAttentions]:
+        r"""
+        Forward pass for the language encoder.
+
+        Processes input sequences through the encoder transformer, segmenting them into fixed-size
+        windows and returning compressed representations.
+
+        Args:
+            input_ids (`torch.LongTensor` of shape `(batch_size, seq_len)`, *optional*):
+                Input token IDs. Sequence will be padded to be divisible by `window_size` if needed.
+                After padding, `segment_num = ceil(seq_len / window_size)`.
+            past_key_values (`Cache`, *optional*):
+                Cached key-value states for efficient generation.
+            cache_position (`torch.LongTensor` of shape `(seq_len,)`, *optional*):
+                Position indices for the cache.
+            attention_mask (`torch.FloatTensor` of shape `(batch_size, seq_len)`, *optional*):
+                Attention mask to avoid performing attention on padding token indices.
+            token_type_ids (`torch.LongTensor` of shape `(batch_size, seq_len)`, *optional*):
+                Token type IDs for distinguishing different sequences.
+            position_ids (`torch.LongTensor` of shape `(batch_size, seq_len)`, *optional*):
+                Position indices for each input sequence token.
+            inputs_embeds (`torch.FloatTensor` of shape `(batch_size, seq_len, hidden_size)`, *optional*):
+                Pre-computed embeddings instead of `input_ids`.
+            encoder_hidden_states (`torch.Tensor`, *optional*):
+                Hidden states from an encoder for cross-attention.
+            encoder_attention_mask (`torch.FloatTensor`, *optional*):
+                Attention mask for encoder hidden states.
+            use_cache (`bool`, *optional*):
+                Whether to return cached key-value states.
+            output_attentions (`bool`, *optional*):
+                Whether to return attention weights.
+            output_hidden_states (`bool`, *optional*):
+                Whether to return hidden states from all layers.
+            return_dict (`bool`, *optional*):
+                Whether to return a dict instead of tuple.
+
+        Returns:
+            [`BaseAutoencoderOutputWithPastAndCrossAttentions`] or `tuple`:
+                - `last_tail_hidden_state`: Final position hidden state per segment, 
+                  with shape `(batch_size, segment_num, hidden_size)`.
+                - `last_window_hidden_state`: Hidden states for window positions, 
+                  with shape `(batch_size, segment_num * window_size, hidden_size)`.
+                - `last_hidden_state`: Full hidden states from final layer, 
+                  with shape `(batch_size, segment_num * window_size, hidden_size)`.
+                - `past_key_values`: Cached key-value states.
+                - `hidden_states`: Hidden states from all layers (if requested), 
+                  tuple of `(batch_size, segment_num * window_size, hidden_size) * num_hidden_layers_encoder`.
+                - `attentions`: Attention weights (if requested).
+                - `cross_attentions`: Cross-attention weights (if applicable).
+        """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         pre_process_res: PreprocessOutput = self.pre_process_inputs(input_ids=input_ids, inputs_embeds=inputs_embeds)
@@ -540,10 +690,6 @@ class LanguageEncoderLatentHead(GPT2PreTrainedModel, GenerationMixin):
         self.lm_head = copy.deepcopy(pretrained_model.lm_head)
         return self
 
-    @auto_docstring(
-        custom_intro="Forward pass for the language encoder with LM head.",
-        checkpoint="GPT2PreTrainedModel",
-    )
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -564,22 +710,59 @@ class LanguageEncoderLatentHead(GPT2PreTrainedModel, GenerationMixin):
         **kwargs,
     ) -> Union[tuple, CausalLMAutoencoderOutputWithCrossAttentions]:
         r"""
-        input_ids (`torch.LongTensor` of shape `(batch_size, input_ids_length)`):
-            `input_ids_length` = `sequence_length` if `past_key_values` is `None` else
-            `past_key_values.get_seq_length()` (`sequence_length` of input past key value states). Indices of input
-            sequence tokens in the vocabulary.
+        Forward pass for the language encoder with latent head.
 
-            If `past_key_values` is used, only `input_ids` that do not have their past calculated should be passed as
-            `input_ids`.
+        Processes input sequences through the encoder and produces both latent representations
+        and vocabulary logits for language modeling.
 
-            Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.encode`] and
-            [`PreTrainedTokenizer.__call__`] for details.
+        Args:
+            input_ids (`torch.LongTensor` of shape `(batch_size, seq_len)`, *optional*):
+                Input token IDs. Sequence will be padded to be divisible by `window_size` if needed.
+                After padding, `segment_num = ceil(seq_len / window_size)`.
+            past_key_values (`Cache`, *optional*):
+                Cached key-value states for efficient generation.
+            cache_position (`torch.LongTensor` of shape `(seq_len,)`, *optional*):
+                Position indices for the cache.
+            attention_mask (`torch.FloatTensor` of shape `(batch_size, seq_len)`, *optional*):
+                Attention mask to avoid performing attention on padding token indices.
+            token_type_ids (`torch.LongTensor` of shape `(batch_size, seq_len)`, *optional*):
+                Token type IDs for distinguishing different sequences.
+            position_ids (`torch.LongTensor` of shape `(batch_size, seq_len)`, *optional*):
+                Position indices for each input sequence token.
+            inputs_embeds (`torch.FloatTensor` of shape `(batch_size, seq_len, hidden_size)`, *optional*):
+                Pre-computed embeddings instead of `input_ids`.
+            encoder_hidden_states (`torch.Tensor`, *optional*):
+                Hidden states from an encoder for cross-attention.
+            encoder_attention_mask (`torch.FloatTensor`, *optional*):
+                Attention mask for encoder hidden states.
+            labels (`torch.LongTensor` of shape `(batch_size, seq_len)`, *optional*):
+                Labels for language modeling. Note that the labels **are shifted** inside the model.
+            use_cache (`bool`, *optional*):
+                Whether to return cached key-value states.
+            output_attentions (`bool`, *optional*):
+                Whether to return attention weights.
+            output_hidden_states (`bool`, *optional*):
+                Whether to return hidden states from all layers.
+            return_dict (`bool`, *optional*):
+                Whether to return a dict instead of tuple.
+            logits_to_keep (`int` or `torch.Tensor`, *optional*, defaults to 0):
+                Number of logits to keep from the end of the sequence for memory efficiency.
 
-            [What are input IDs?](../glossary#input-ids)
-        labels (`torch.LongTensor` of shape `(batch_size, input_ids_length)`, *optional*):
-            Labels for language modeling. Note that the labels **are shifted** inside the model, i.e. you can set
-            `labels = input_ids` Indices are selected in `[-100, 0, ..., config.vocab_size]` All labels set to `-100`
-            are ignored (masked), the loss is only computed for labels in `[0, ..., config.vocab_size]`
+        Returns:
+            [`CausalLMAutoencoderOutputWithCrossAttentions`] or `tuple`:
+                - `logits`: Language modeling logits with shape `(batch_size, logits_to_keep, vocab_size)` 
+                  if `logits_to_keep > 0`, otherwise empty.
+                - `last_tail_hidden_state`: Final position hidden state per segment, 
+                  with shape `(batch_size, segment_num, hidden_size)` (if `output_hidden_states=True`).
+                - `last_window_hidden_state`: Hidden states for window positions, 
+                  with shape `(batch_size, segment_num * window_size, hidden_size)` (if `output_hidden_states=True`).
+                - `last_hidden_state`: Full hidden states from final layer, 
+                  with shape `(batch_size, segment_num * window_size, hidden_size)` (if `output_hidden_states=True`).
+                - `hidden_states`: Hidden states from all layers (if requested), 
+                  tuple of `(batch_size, segment_num * window_size, hidden_size) * num_hidden_layers_encoder`.
+                - `attentions`: Attention weights (if requested).
+                - `cross_attentions`: Cross-attention weights (if applicable).
+                - `latent_embeds`: Latent representations with shape `(batch_size, segment_num, hidden_size)`.
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -619,8 +802,8 @@ class LanguageEncoderLatentHead(GPT2PreTrainedModel, GenerationMixin):
             logits=logits,
             past_key_values=transformer_outputs.past_key_values,
             hidden_states=transformer_outputs.hidden_states if output_hidden_states else None,
-            attentions=transformer_outputs.attentions,
-            cross_attentions=transformer_outputs.cross_attentions,
+            attentions=transformer_outputs.attentions if output_attentions else None,
+            cross_attentions=transformer_outputs.cross_attentions if output_attentions else None,
             latent_embeds=transformer_outputs.last_tail_hidden_state,
             latents=logits,
         )
@@ -749,7 +932,6 @@ class LanguageDecoder(LanguageDecoderBase):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        return_segment: bool = True,
         **kwargs,
     ) -> Union[tuple, CausalLMAutoencoderOutputWithCrossAttentions]:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
@@ -824,10 +1006,6 @@ class LanguageDecoderLMHead(GPT2PreTrainedModel, GenerationMixin):
             multi_head_logits.append(self.multi_lm_head[i](latents))
         return self.transformer.ae_utils.flatten_multi_heads_logits(logits=multi_head_logits)
 
-    @auto_docstring(
-        custom_intro="Forward pass for the language decoder with LM head.",
-        checkpoint="GPT2PreTrainedModel",
-    )
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -849,15 +1027,62 @@ class LanguageDecoderLMHead(GPT2PreTrainedModel, GenerationMixin):
         **kwargs,
     ) -> Union[tuple, CausalLMAutoencoderOutputWithCrossAttentions]:
         r"""
-        inputs_latents (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
-            Latent representations to be decoded. These are typically output from the encoder component of the
-            autoencoder and represent compressed semantic information to be expanded back into token sequences.
-        input_ids (`torch.LongTensor` of shape `(batch_size, input_ids_length)`):
-            LangaugeDeocder and LanuageDecoderLMHead don't process input_ides, please use input_latents instead.
-        labels (`torch.LongTensor` of shape `(batch_size, input_ids_length)`, *optional*):
-            Labels for language modeling. Note that the labels **are shifted** inside the model, i.e. you can set
-            `labels = input_ids` Indices are selected in `[-100, 0, ..., config.vocab_size]` All labels set to `-100`
-            are ignored (masked), the loss is only computed for labels in `[0, ..., config.vocab_size]`
+        Forward pass for the language decoder with LM head.
+
+        Processes latent representations through the decoder transformer and generates vocabulary
+        logits for language modeling using multi-head projection.
+
+        Args:
+            input_ids (`torch.LongTensor` of shape `(batch_size, input_ids_length)`, *optional*):
+                LanguageDecoder and LanguageDecoderLMHead don't process input_ids, please use inputs_latents instead.
+            inputs_latents (`torch.FloatTensor` of shape `(batch_size, segment_num, latent_dim)`, *optional*):
+                Latent representations to be decoded. These are typically output from the encoder component of the
+                autoencoder and represent compressed semantic information to be expanded back into token sequences.
+            past_key_values (`Cache`, *optional*):
+                Cached key-value states for efficient generation.
+            cache_position (`torch.LongTensor` of shape `(seq_len,)`, *optional*):
+                Position indices for the cache.
+            attention_mask (`torch.FloatTensor` of shape `(batch_size, seq_len)`, *optional*):
+                Attention mask to avoid performing attention on padding token indices.
+            token_type_ids (`torch.LongTensor` of shape `(batch_size, seq_len)`, *optional*):
+                Token type IDs for distinguishing different sequences.
+            position_ids (`torch.LongTensor` of shape `(batch_size, seq_len)`, *optional*):
+                Position indices for each input sequence token.
+            inputs_embeds (`torch.FloatTensor` of shape `(batch_size, seq_len, hidden_size)`, *optional*):
+                Pre-computed embeddings instead of `inputs_latents`.
+            encoder_hidden_states (`torch.Tensor`, *optional*):
+                Hidden states from an encoder for cross-attention.
+            encoder_attention_mask (`torch.FloatTensor`, *optional*):
+                Attention mask for encoder hidden states.
+            labels (`torch.LongTensor` of shape `(batch_size, seq_len)`, *optional*):
+                Labels for language modeling. Note that the labels **are shifted** inside the model, i.e. you can set
+                `labels = input_ids` Indices are selected in `[-100, 0, ..., config.vocab_size]` All labels set to `-100`
+                are ignored (masked), the loss is only computed for labels in `[0, ..., config.vocab_size]`
+            use_cache (`bool`, *optional*):
+                Whether to return cached key-value states.
+            output_attentions (`bool`, *optional*):
+                Whether to return attention weights.
+            output_hidden_states (`bool`, *optional*):
+                Whether to return hidden states from all layers.
+            return_dict (`bool`, *optional*):
+                Whether to return a dict instead of tuple.
+            logits_to_keep (`int` or `torch.Tensor`, *optional*, defaults to 0):
+                Number of logits to keep from the end of the sequence for memory efficiency.
+
+        Returns:
+            [`CausalLMAutoencoderOutputWithCrossAttentions`] or `tuple`:
+                - `logits`: Token prediction logits with shape `(batch_size, segment_num * window_size, vocab_size)`.
+                - `last_tail_hidden_state`: Final position hidden state per segment, 
+                  with shape `(batch_size, segment_num, hidden_size)` (if `output_hidden_states=True`).
+                - `last_window_hidden_state`: Hidden states for window positions, 
+                  with shape `(batch_size, segment_num * window_size, hidden_size)` (if `output_hidden_states=True`).
+                - `last_hidden_state`: Full hidden states from final layer, 
+                  with shape `(batch_size, segment_num * window_size, hidden_size)` (if `output_hidden_states=True`).
+                - `hidden_states`: Hidden states from all layers (if requested), 
+                  tuple of `(batch_size, segment_num * window_size, hidden_size) * num_hidden_layers_decoder`.
+                - `attentions`: Attention weights (if requested).
+                - `cross_attentions`: Cross-attention weights (if applicable).
+                - `latent_embeds`: Latent embeddings with shape `(batch_size, segment_num, hidden_size)`.
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         
@@ -902,8 +1127,8 @@ class LanguageDecoderLMHead(GPT2PreTrainedModel, GenerationMixin):
             logits=logits,
             past_key_values=transformer_outputs.past_key_values,
             hidden_states=transformer_outputs.hidden_states if output_hidden_states else None,
-            attentions=transformer_outputs.attentions,
-            cross_attentions=transformer_outputs.cross_attentions,
+            attentions=transformer_outputs.attentions if output_attentions else None,
+            cross_attentions=transformer_outputs.cross_attentions if output_attentions else None,
             latent_embeds=inferred_inputs_embeds,
             latents=inputs_latents,
         )
@@ -952,6 +1177,63 @@ class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs,
     ) -> Union[tuple, CausalLMAutoencoderOutputWithCrossAttentions]:
+        """
+        Encode input sequences into latent representations.
+
+        This method processes input sequences through the encoder transformer, segmenting them into
+        fixed-size windows and producing compressed latent representations.
+
+        Args:
+            input_ids (`torch.LongTensor` of shape `(batch_size, seq_len)`, *optional*):
+                Input token IDs to encode. Sequence length should be divisible by
+                `window_size` for optimal processing (padding is applied if not).
+                After padding, `segment_num = ceil(seq_len / window_size)`.
+            past_key_values (`Cache`, *optional*):
+                Cached key-value states for efficient generation.
+            cache_position (`torch.LongTensor` of shape `(seq_len,)`, *optional*):
+                Position indices for the cache.
+            attention_mask (`torch.FloatTensor` of shape `(batch_size, seq_len)`, *optional*):
+                Attention mask to avoid performing attention on padding token indices.
+            token_type_ids (`torch.LongTensor` of shape `(batch_size, seq_len)`, *optional*):
+                Token type IDs for distinguishing different sequences.
+            position_ids (`torch.LongTensor` of shape `(batch_size, seq_len)`, *optional*):
+                Position indices for each input sequence token.
+            inputs_embeds (`torch.FloatTensor` of shape `(batch_size, seq_len, hidden_size)`, *optional*):
+                Pre-computed embeddings instead of `input_ids`.
+            encoder_hidden_states (`torch.Tensor`, *optional*):
+                Hidden states from an encoder for cross-attention.
+            encoder_attention_mask (`torch.FloatTensor`, *optional*):
+                Attention mask for encoder hidden states.
+            labels (`torch.LongTensor` of shape `(batch_size, seq_len)`, *optional*):
+                Not used in encoding, included for API consistency.
+            use_cache (`bool`, *optional*):
+                Whether to return cached key-value states.
+            output_attentions (`bool`, *optional*):
+                Whether to return attention weights.
+            output_hidden_states (`bool`, *optional*):
+                Whether to return hidden states from all layers.
+            return_dict (`bool`, *optional*):
+                Whether to return a dict instead of tuple.
+            logits_to_keep (`int` or `torch.Tensor`, *optional*, defaults to 0):
+                Number of logits to keep from the end of the sequence for memory efficiency.
+
+        Returns:
+            [`CausalLMAutoencoderOutputWithCrossAttentions`] or `tuple`:
+                Encoder outputs containing:
+                - `latents`: Compressed latent vectors with shape `(batch_size, segment_num, latent_dim)`.
+                - `last_tail_hidden_state`: Final hidden state per segment with shape `(batch_size, segment_num, hidden_size)`.
+                - `last_window_hidden_state`: Hidden states for window positions with shape `(batch_size, segment_num * window_size, hidden_size)`.
+                - `last_hidden_state`: Full hidden states from final layer with shape `(batch_size, segment_num * window_size, hidden_size)`.
+                - `hidden_states`: All layer outputs (if requested), tuple of `(batch_size, segment_num * window_size, hidden_size) * num_hidden_layers_encoder`.
+                - `attentions`: Attention weights (if requested).
+
+        Example:
+            ```python
+            # Encode text to latents
+            encoder_output = model.encode(input_ids=input_ids)
+            latents = encoder_output.latents  # (batch_size, segment_num, latent_dim)
+            ```
+        """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         encoder_output = self.encoder(
@@ -994,6 +1276,66 @@ class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs,
     ) -> Union[tuple, CausalLMAutoencoderOutputWithCrossAttentions]:
+        """
+        Decode latent representations into token sequences.
+
+        This method processes latent vectors through the decoder transformer to generate
+        token logits for language modeling. Each latent is expanded to `window_size` token predictions.
+
+        Args:
+            input_ids (`torch.LongTensor` of shape `(batch_size, input_ids_length)`, *optional*):
+                Not typically used in decoding, included for API consistency.
+            inputs_latents (`torch.FloatTensor` of shape `(batch_size, segment_num, latent_dim)`, *optional*):
+                Latent representations to decode. Each latent is expanded to `window_size` token predictions.
+            past_key_values (`Cache`, *optional*):
+                Cached key-value states for efficient generation.
+            cache_position (`torch.LongTensor` of shape `(seq_len,)`, *optional*):
+                Position indices for the cache.
+            attention_mask (`torch.FloatTensor` of shape `(batch_size, seq_len)`, *optional*):
+                Attention mask to avoid performing attention on padding token indices.
+            token_type_ids (`torch.LongTensor` of shape `(batch_size, seq_len)`, *optional*):
+                Token type IDs for distinguishing different sequences.
+            position_ids (`torch.LongTensor` of shape `(batch_size, seq_len)`, *optional*):
+                Position indices for each input sequence token.
+            inputs_embeds (`torch.FloatTensor` of shape `(batch_size, seq_len, hidden_size)`, *optional*):
+                Pre-computed embeddings to use instead of latents.
+            encoder_hidden_states (`torch.Tensor`, *optional*):
+                Hidden states from an encoder for cross-attention.
+            encoder_attention_mask (`torch.FloatTensor`, *optional*):
+                Attention mask for encoder hidden states.
+            labels (`torch.LongTensor` of shape `(batch_size, seq_len)`, *optional*):
+                Not used in decoding, included for API consistency.
+            use_cache (`bool`, *optional*):
+                Whether to return cached key-value states.
+            output_attentions (`bool`, *optional*):
+                Whether to return attention weights.
+            output_hidden_states (`bool`, *optional*):
+                Whether to return hidden states from all layers.
+            return_dict (`bool`, *optional*):
+                Whether to return a dict instead of tuple.
+            logits_to_keep (`int` or `torch.Tensor`, *optional*, defaults to 0):
+                Number of logits to keep from the end of the sequence for memory efficiency.
+
+        Returns:
+            [`CausalLMAutoencoderOutputWithCrossAttentions`] or `tuple`:
+                Decoder outputs containing:
+                - `logits`: Token prediction logits with shape `(batch_size, segment_num * window_size, vocab_size)`.
+                - `last_tail_hidden_state`: Final position hidden state per segment with shape `(batch_size, segment_num, hidden_size)`.
+                - `last_window_hidden_state`: Hidden states for decoded positions with shape `(batch_size, segment_num * window_size, hidden_size)`.
+                - `last_hidden_state`: Full hidden states from final layer with shape `(batch_size, segment_num * window_size, hidden_size)`.
+                - `hidden_states`: All layer outputs (if requested), tuple of `(batch_size, segment_num * window_size, hidden_size) * num_hidden_layers_decoder`.
+                - `attentions`: Attention weights (if requested).
+                - `latent_embeds`: Latent embeddings with shape `(batch_size, segment_num, hidden_size)`.
+                - `latents`: Input latent representations with shape `(batch_size, segment_num, latent_dim)`.
+
+        Example:
+            ```python
+            # First encode, then decode
+            encoder_output = model.encode(input_ids=input_ids)
+            decoder_output = model.decode(inputs_latents=encoder_output.latents)
+            logits = decoder_output.logits  # (batch_size, segment_num * window_size, vocab_size)
+            ```
+        """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         
         decoder_output = self.decoder(
@@ -1137,7 +1479,7 @@ class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
             return (ae_output, encoder_output, decoder_output)
         return ae_output
     
-    def _loss_function(
+    def loss_function(
         self,
         logits: torch.FloatTensor,
         labels: torch.LongTensor,
