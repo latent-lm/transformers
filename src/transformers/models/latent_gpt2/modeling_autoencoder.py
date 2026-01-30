@@ -160,6 +160,13 @@ class SequenceWindowUtilsBase:
         return self._window_size
 
     def _get_padding_embed(self) -> torch.FloatTensor:
+        """
+        Get the padding token embedding.
+
+        Returns:
+            `torch.FloatTensor` of shape `(1, hidden_size)`:
+                Padding token embedding tensor.
+        """
         if self._padding_embed is None:
             if self._wte is None:
                 raise ValueError("To get padding_embed, either provide padding_embed or wte")
@@ -167,11 +174,25 @@ class SequenceWindowUtilsBase:
         return self._padding_embed
 
     def _get_padding_token(self) -> torch.LongTensor:
+        """
+        Get the padding token ID.
+
+        Returns:
+            `torch.LongTensor`:
+                Padding token ID scalar.
+        """
         if self._padding_token is None:
             raise ValueError("padding_token is not set")
         return self._padding_token
     
     def _get_masking_embed(self) -> torch.FloatTensor:
+        """
+        Get the masking token embedding.
+
+        Returns:
+            `torch.FloatTensor` of shape `(1, hidden_size)`:
+                Masking token embedding tensor.
+        """
         if self._masking_embed is None:
             if self._wte is None:
                 raise ValueError("To get masking_embed, either provide masking_embed or wte")
@@ -179,11 +200,29 @@ class SequenceWindowUtilsBase:
         return self._masking_embed
 
     def _get_masking_token(self) -> torch.LongTensor:
+        """
+        Get the masking token ID.
+
+        Returns:
+            `torch.LongTensor`:
+                Masking token ID scalar.
+        """
         if self._masking_token is None:
             raise ValueError("masking_token is not set")
         return self._masking_token
     
-    def _get_token(self, token_type: str):
+    def _get_token(self, token_type: str) -> torch.LongTensor:
+        """
+        Get token ID based on token type.
+
+        Args:
+            token_type (`str`):
+                Type of token to retrieve. Must be one of `"padding"` or `"masking"`.
+
+        Returns:
+            `torch.LongTensor`:
+                Token ID scalar for the specified type.
+        """
         if token_type == SequenceWindowUtilsBase.TOKEN_TYPE_PADDING:
             return self._get_padding_token()
         elif token_type == SequenceWindowUtilsBase.TOKEN_TYPE_MASKING:
@@ -191,7 +230,18 @@ class SequenceWindowUtilsBase:
         else:
             raise ValueError(f"token_type, {token_type}, isn't supported, only support {SequenceWindowUtilsBase.SUPPORTED_TOKEN_TYPES}")
         
-    def _get_embed(self, token_type: str):
+    def _get_embed(self, token_type: str) -> torch.FloatTensor:
+        """
+        Get token embedding based on token type.
+
+        Args:
+            token_type (`str`):
+                Type of token embedding to retrieve. Must be one of `"padding"` or `"masking"`.
+
+        Returns:
+            `torch.FloatTensor` of shape `(1, hidden_size)`:
+                Token embedding tensor for the specified type.
+        """
         if token_type == SequenceWindowUtilsBase.TOKEN_TYPE_PADDING:
             return self._get_padding_embed()
         elif token_type == SequenceWindowUtilsBase.TOKEN_TYPE_MASKING:
@@ -222,7 +272,7 @@ class SequenceWindowUtilsBase:
                 Returns `None` if input sequence is `None`.
         """
         if sequence is None:
-            return sequence
+            return None
         if self._window_size == 0:
             return sequence
 
@@ -257,7 +307,7 @@ class SequenceWindowUtilsBase:
                 Returns `None` if input sequence is `None`.
         """
         if sequence is None:
-            return sequence
+            return None
         # Reshape from (batch_size * segment_num, window_size, ...) back to (batch_size, segment_num * window_size, ...)
         # segment_num was computed as ceil(original_seq_len / window_size) during aggregation
         return sequence.reshape(self._batch_size, self._segment_num * sequence.shape[1], *sequence.shape[2:])
@@ -356,18 +406,27 @@ class SequenceWindowUtilsBase:
 class LanguageEncoderUtils(SequenceWindowUtilsBase):
     """Encoder utilities that aggregate sequences into fixed-size windows."""
 
-    def agg_sequence(self, sequence: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def agg_sequence(self, sequence: Optional[torch.Tensor] = None) -> Optional[torch.Tensor]:
         """
         Aggregate a sequence into fixed-size windows.
 
+        This method takes an input sequence and reshapes it into fixed-size windows by:
+        1. Padding the sequence to make it divisible by window_size
+        2. Computing segment_num = ceil(seq_len / window_size)
+        3. Reshaping to (batch_size * segment_num, window_size, ...)
+
         Args:
-            sequence: The sequence to aggregate. Shape (batch_size, seq_len) or (batch_size, seq_len, embed_dim).
+            sequence (`torch.Tensor` of shape `(batch_size, seq_len)` or `(batch_size, seq_len, embed_dim)`, *optional*):
+                The sequence to aggregate into windows. For 2D tensors, represents token IDs.
+                For 3D tensors, represents token embeddings.
 
         Returns:
-            Aggregated sequence with shape (batch_size * segment_num, window_size, ...).
+            `torch.Tensor` of shape `(batch_size * segment_num, window_size)` or `(batch_size * segment_num, window_size, embed_dim)`, *optional*:
+                Aggregated sequence reshaped into windowed format where each window becomes a separate batch element.
+                Returns `None` if input sequence is `None`.
         """
         if sequence is None:
-            return sequence
+            return None
         self._batch_size = sequence.shape[0]
         self._seq_len = sequence.shape[1]
         padded_sequence = self._pad(sequence=sequence, token_type=SequenceWindowUtilsBase.TOKEN_TYPE_PADDING)
@@ -381,18 +440,25 @@ class LanguageEncoderUtils(SequenceWindowUtilsBase):
 class LanguageDecoderUtils(SequenceWindowUtilsBase):
     """Decoder utilities that handle single-element and window-based sequence operations."""
 
-    def agg_sequence(self, sequence: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def agg_sequence(self, sequence: Optional[torch.Tensor] = None) -> Optional[torch.Tensor]:
         """
         Aggregate a sequence into single-element segments.
 
+        This method reshapes each position in the sequence into a separate batch element
+        for autoregressive processing. Each token position becomes its own segment of size 1.
+
         Args:
-            sequence: The sequence to aggregate. Shape (batch_size, seq_len, ...).
+            sequence (`torch.Tensor` of shape `(batch_size, seq_len)` or `(batch_size, seq_len, ...)`, *optional*):
+                The sequence to aggregate into single-element segments.
 
         Returns:
-            Aggregated sequence with shape (batch_size * seq_len, 1, ...).
+            `torch.Tensor` of shape `(batch_size * seq_len, 1)` or `(batch_size * seq_len, 1, ...)`, *optional*:
+                Aggregated sequence where each original position becomes a separate batch element.
+                segment_num = seq_len (each element is its own segment).
+                Returns `None` if input sequence is `None`.
         """
         if sequence is None:
-            return sequence
+            return None
         self._batch_size = sequence.shape[0]
         self._seq_len = sequence.shape[1]
         # For single-element aggregation: segment_num = seq_len (each element is a segment)
@@ -404,19 +470,27 @@ class LanguageDecoderUtils(SequenceWindowUtilsBase):
         self,
         sequence: Optional[torch.Tensor] = None,
         token_type: str = SequenceWindowUtilsBase.TOKEN_TYPE_PADDING,
-    ) -> torch.Tensor:
+    ) -> Optional[torch.Tensor]:
         """
         Internal method to aggregate a sequence into window_size-length segments.
 
+        This private method pads the sequence and reshapes it into fixed-size windows,
+        similar to LanguageEncoderUtils.agg_sequence but with configurable token types.
+
         Args:
-            sequence: The sequence to aggregate. Shape (batch_size, seq_len, ...).
-            token_type: Token type for padding ("padding" or "masking").
+            sequence (`torch.Tensor` of shape `(batch_size, seq_len)` or `(batch_size, seq_len, ...)`, *optional*):
+                The sequence to aggregate into windows.
+            token_type (`str`, *optional*, defaults to `"padding"`):
+                Token type for padding. Must be one of `"padding"` or `"masking"`.
 
         Returns:
-            Aggregated sequence with shape (batch_size * segment_num, window_size, ...).
+            `torch.Tensor` of shape `(batch_size * segment_num, window_size)` or `(batch_size * segment_num, window_size, ...)`, *optional*:
+                Aggregated sequence reshaped into windowed format.
+                segment_num = ceil(seq_len / window_size).
+                Returns `None` if input sequence is `None`.
         """
         if sequence is None:
-            return sequence
+            return None
         self._batch_size = sequence.shape[0]
         self._seq_len = sequence.shape[1]
         padded_sequence = self._pad(sequence=sequence, token_type=token_type)
@@ -425,19 +499,26 @@ class LanguageDecoderUtils(SequenceWindowUtilsBase):
         self._segment_num = padded_sequence.shape[1] // self._window_size
         return padded_sequence.view(self._batch_size * self._segment_num, self._window_size, *padded_sequence.shape[2:])
 
-    def agg_sequence_by_window_size(self, sequence: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def agg_sequence_by_window_size(self, sequence: Optional[torch.Tensor] = None) -> Optional[torch.Tensor]:
         """
         Aggregate a sequence into window_size-length segments, padding if necessary.
 
+        This method aggregates the input sequence into fixed-size windows using padding tokens.
+        It's a public wrapper around _agg_sequence_by_window with padding token type.
+
         Args:
-            sequence: The sequence to aggregate. Shape (batch_size, seq_len, ...).
+            sequence (`torch.Tensor` of shape `(batch_size, seq_len)` or `(batch_size, seq_len, ...)`, *optional*):
+                The sequence to aggregate into windows.
 
         Returns:
-            Aggregated sequence with shape (batch_size * segment_num, window_size, ...).
+            `torch.Tensor` of shape `(batch_size * segment_num, window_size)` or `(batch_size * segment_num, window_size, ...)`, *optional*:
+                Aggregated sequence with padding tokens if needed to reach window_size boundaries.
+                segment_num = ceil(seq_len / window_size).
+                Returns `None` if input sequence is `None`.
         """
         return self._agg_sequence_by_window(sequence, token_type=SequenceWindowUtilsBase.TOKEN_TYPE_PADDING)
 
-    def agg_sequence_mask_diffusion(self, sequence: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def agg_sequence_mask_diffusion(self, sequence: Optional[torch.Tensor] = None) -> Optional[torch.Tensor]:
         """
         Aggregate a masked sequence into window_size-length segments for diffusion decoding.
 
@@ -446,10 +527,14 @@ class LanguageDecoderUtils(SequenceWindowUtilsBase):
         tokens if sequence length is not divisible by window_size.
 
         Args:
-            sequence: The masked token sequence. Shape (batch_size, seq_len, ...).
+            sequence (`torch.Tensor` of shape `(batch_size, seq_len)` or `(batch_size, seq_len, ...)`, *optional*):
+                The masked token sequence to aggregate.
 
         Returns:
-            Aggregated sequence with shape (batch_size * segment_num, window_size, ...).
+            `torch.Tensor` of shape `(batch_size * segment_num, window_size)` or `(batch_size * segment_num, window_size, ...)`, *optional*:
+                Aggregated sequence with masking tokens used for padding if needed.
+                segment_num = ceil(seq_len / window_size).
+                Returns `None` if input sequence is `None`.
         """
         return self._agg_sequence_by_window(sequence, token_type=SequenceWindowUtilsBase.TOKEN_TYPE_MASKING)
 
@@ -457,11 +542,19 @@ class LanguageDecoderUtils(SequenceWindowUtilsBase):
         """
         Flatten multi-head logits into a single sequence.
 
+        This method combines logits from multiple decoder heads (one per window position) into
+        a single contiguous sequence. Used in multi-head language modeling where each position
+        in a window has its own dedicated prediction head.
+
         Args:
-            logits: List of tensors of shape (batch_size, segment_num, vocab_size) with length window_size.
+            logits (`List[torch.Tensor]`):
+                List of logits tensors from multiple heads, each with shape `(batch_size, segment_num, vocab_size)`.
+                List length must equal `window_size`.
 
         Returns:
-            Flattened logits with shape (batch_size, segment_num * window_size, vocab_size).
+            `torch.Tensor` of shape `(batch_size, segment_num * window_size, vocab_size)`:
+                Flattened logits where predictions from all heads are concatenated along the sequence dimension.
+                The order follows: [head_0_predictions, head_1_predictions, ..., head_window_size_predictions].
         """
         # Flatten from multiple heads to single sequence
         # Final shape: (batch_size, segment_num * window_size, vocab_size)
@@ -471,14 +564,23 @@ class LanguageDecoderUtils(SequenceWindowUtilsBase):
     
     def pad(self, sequence: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        Pad the given sequence to be a multiple of window_size.
+        Pad the given sequence with padding tokens to be a multiple of window_size.
 
-        If sequence is None, return None.
-        For 2D sequence (batch_size, seq_len), pad with padding_token.
-        For 3D sequence (batch_size, seq_len, embedding_size), pad with padding_embed.
+        The padded_seq_len is calculated as the smallest multiple of window_size that is 
+        greater than or equal to the input seq_len. Specifically:
+        `padded_seq_len = seq_len + pad_len` where 
+        `pad_len = (window_size - (seq_len % window_size)) % window_size`
+
+        Args:
+            sequence (`torch.Tensor` of shape `(batch_size, seq_len)` or `(batch_size, seq_len, hidden_size)`, *optional*):
+                Input sequence to pad. For 2D tensors, pad with token IDs. For 3D tensors, pad with embeddings.
 
         Returns:
-            torch.Tensor: Padded sequence with length divisible by window_size.
+            `torch.Tensor`:
+                Padded sequence with shape `(batch_size, padded_seq_len)` for 2D input or 
+                `(batch_size, padded_seq_len, hidden_size)` for 3D input, where 
+                `padded_seq_len` is the smallest multiple of `window_size` >= `seq_len`.
+                Returns `None` if input sequence is `None`.
         """
         return super()._pad(sequence=sequence, token_type=SequenceWindowUtilsBase.TOKEN_TYPE_PADDING)
 
