@@ -910,12 +910,12 @@ class LanguageEncoderLatentHead(GPT2PreTrainedModel, GenerationMixin):
             return_dict=True,
         )
         # Only use the last hidden_state of the last layer as latent
-        latents = transformer_outputs.last_tail_hidden_state
+        last_tail_hidden_state = transformer_outputs.last_tail_hidden_state
         
         # Project the latents to logits
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.latent_head(latents[:, slice_indices, :])
-        latents = self.latent_head(latents)
+        logits = self.latent_head(last_tail_hidden_state[:, slice_indices, :])
+        latents = self.latent_head(last_tail_hidden_state)
 
         loss = None
 
@@ -1518,7 +1518,8 @@ class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
             hidden_states=dict_output.hidden_states if output_hidden_states else None,
             attentions=dict_output.attentions if output_attentions else None,
             cross_attentions=dict_output.cross_attentions if output_attentions else None,
-            latents=dict_output.last_tail_hidden_state,
+            latent_embeds=dict_output.latent_embeds,
+            latents=dict_output.latents,
         )
 
     @auto_docstring(
@@ -1651,8 +1652,8 @@ class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
             hidden_states=decoder_output.hidden_states if output_hidden_states else None,
             attentions=decoder_output.attentions if output_attentions else None,
             cross_attentions=decoder_output.cross_attentions if output_attentions else None,
-            latents_embed=encoder_output.latent_embeds,
-            latents=encoder_output.last_tail_hidden_state,
+            latent_embeds=encoder_output.latent_embeds,
+            latents=encoder_output.latents,
         )
         # Handle encoder and decoder dict output format
         encoder_output = self._format_dict_output(dict_output=encoder_output, output_attentions=output_attentions, output_hidden_states=output_hidden_states)
