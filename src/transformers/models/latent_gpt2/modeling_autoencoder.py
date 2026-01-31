@@ -16,15 +16,13 @@
 """PyTorch OpenAI GPT-2 model."""
 
 import copy
-import math
 import warnings
-from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
 import torch
 from torch import nn
 
-from ...cache_utils import Cache, DynamicCache, EncoderDecoderCache
+from ...cache_utils import Cache
 from ...generation import GenerationMixin
 from ...modeling_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
@@ -47,6 +45,14 @@ logger = logging.get_logger(__name__)
 )
 class LanguageEncoderBase(GPT2ModelBase):
     def __init__(self, config: LatentGPT2Config):
+        """
+        Initializes the LanguageEncoderBase model.
+
+        Args:
+            config (`LatentGPT2Config`):
+                The model configuration object.
+
+        """
         super().__init__(config)
 
         self.embed_dim = config.hidden_size
@@ -70,6 +76,16 @@ class LanguageEncoderBase(GPT2ModelBase):
 )
 class LanguageDecoderBase(GPT2ModelBase):
     def __init__(self, config: LatentGPT2Config):
+        """
+        Initializes the LanguageDecoderBase model.
+
+        Args:
+            config (`LatentGPT2Config`):
+                The model configuration object.
+        
+        Initializes the weights of the model and applies final processing.
+        If the latent dimension matches the hidden dimension, sets the weight of `wte_latent` to the identity matrix.
+        """
         super().__init__(config)
 
         self.embed_dim = config.hidden_size
@@ -131,6 +147,18 @@ class SequenceWindowUtilsBase:
         masking_embed: Optional[torch.FloatTensor] = None,
         wte: Optional[torch.nn.Embedding] = None,
     ):
+        """
+        Initialize SequenceWindowUtilsBase with the given parameters.
+
+        Parameters:
+            window_size (int): Window size for sequence division.
+            padding_token (Optional[int]): Token to pad with.
+            padding_embed (Optional[torch.FloatTensor]): Embedding to pad with.
+            masking_token (Optional[int]): Token to mask with.
+            masking_embed (Optional[torch.FloatTensor]): Embedding to mask with.
+            wte (Optional[torch.nn.Embedding]): Embedding weights to use for padding.
+        """
+        
         self._batch_size: int = None
         self._seq_len: int = None
         # segment_num: Number of segments after dividing sequence into fixed-size windows
@@ -849,8 +877,8 @@ class LanguageEncoderLatentHead(GPT2PreTrainedModel, GenerationMixin):
 
         Returns:
             [`CausalLMAutoencoderOutputWithCrossAttentions`] or `tuple`:
-                - `logits`: Language modeling logits with shape `(batch_size, logits_to_keep, vocab_size)` 
-                  if `logits_to_keep > 0`, otherwise empty. if logits_to_keep = 0, logits is in shape `(batch_size, segment_num, latent_dim)`
+                - `logits`: Latent projection logits with shape `(batch_size, logits_to_keep, latent_dim)` 
+                  if `logits_to_keep > 0`, otherwise shape `(batch_size, segment_num, latent_dim)` (Note: these are latent projections, not vocab logits)
                 - `last_tail_hidden_state`: Final position hidden state per segment, 
                   with shape `(batch_size, segment_num, hidden_size)` (if `output_hidden_states=True`).
                 - `last_window_hidden_state`: Hidden states for window positions, 
@@ -1345,8 +1373,8 @@ class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
 
         Returns:
             [`CausalLMAutoencoderOutputWithCrossAttentions`] or `tuple`:
-                - `logits`: Language modeling logits with shape `(batch_size, logits_to_keep, vocab_size)` 
-                  if `logits_to_keep > 0`, otherwise empty. if logits_to_keep = 0, logits is in shape `(batch_size, segment_num, latent_dim)`
+                - `logits`: Latent projection logits with shape `(batch_size, logits_to_keep, latent_dim)` 
+                  if `logits_to_keep > 0`, otherwise shape `(batch_size, segment_num, latent_dim)` (Note: these are latent projections, not vocab logits)
                 - `last_tail_hidden_state`: Final position hidden state per segment, 
                   with shape `(batch_size, segment_num, hidden_size)` (if `output_hidden_states=True`).
                 - `last_window_hidden_state`: Hidden states for window positions, 
