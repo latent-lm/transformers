@@ -1309,7 +1309,8 @@ class LanguageDecoderLMHead(GPT2PreTrainedModel, GenerationMixin):
     custom_intro="Complete language autoencoder model combining encoder and decoder components for sequence-to-sequence autoencoding with configurable compression. This model implements a full autoencoder architecture that processes sequences through a compress-decompress cycle: 1) Input sequences are segmented into fixed-size windows, 2) Each window is encoded into a single latent vector, 3) Latent vectors are decoded back to token predictions, 4) Multi-head decoding generates multiple tokens per latent. Architecture includes LanguageEncoderLatentHead for encoding and LanguageDecoderLMHead for decoding with tied weights between components. Key features include end-to-end sequence autoencoding, configurable compression ratio via window_size, support for reconstruction and generation, efficient training with label smoothing loss, and weight sharing between encoder and decoder.",
 )
 class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
-    _tied_weights_keys = {"encoder.latent_head.weight": "decoder.transformer.wte_latent.weight"}
+    # Tieing weights doesn't work
+    # _tied_weights_keys = {"encoder.latent_head.weight": "decoder.transformer.wte_latent.weight"}
     def __init__(self, config: LatentGPT2Config):
         super().__init__(config)
         # self.window_size: int = window_size
