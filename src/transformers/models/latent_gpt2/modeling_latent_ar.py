@@ -14,7 +14,7 @@ from .modeling_autoencoder import LanguageAutoencoder, GPT2PreTrainedModel
 from .modeling_diffusion_autoencoder import LanguageDiffusionAutoencoder
 from .modeling_flow_matching import LanguageFlowMatching
 
-class LatnetAutoregressive(GPT2PreTrainedModel, GenerationMixin):
+class LatentAutoregressive(GPT2PreTrainedModel, GenerationMixin):
     DEFAULT_FORWARD_TYPE: str = "latent_fm"
     def __init__(self, config: LatentGPT2Config):
         super().__init__(config)
@@ -28,7 +28,7 @@ class LatnetAutoregressive(GPT2PreTrainedModel, GenerationMixin):
         self.fm: LanguageFlowMatching = LanguageFlowMatching(config=config)
         # self.fm = None
         
-        self._forward_type: str = LatnetAutoregressive.DEFAULT_FORWARD_TYPE
+        self._forward_type: str = LatentAutoregressive.DEFAULT_FORWARD_TYPE
 
         # Initialize weights and apply final processing
         self.post_init()
