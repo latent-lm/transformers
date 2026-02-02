@@ -512,7 +512,7 @@ class LanguageDiffusionDecoderLMHead(GPT2PreTrainedModel, GenerationMixin):
         # Initialize weights and apply final processing
         self.post_init()
 
-    def init_weight_from_pretrained(self, pretrained_model: GPT2LMHeadModel) -> "LanguageDiffusionDecoderLMHead":
+    def init_weight_from_pretrained(self, pretrained_model: GPT2ModelBase) -> "LanguageDiffusionDecoderLMHead":
         """
         Initialize model weights from a pre-trained GPT-2 LM model.
 
@@ -521,7 +521,7 @@ class LanguageDiffusionDecoderLMHead(GPT2PreTrainedModel, GenerationMixin):
         variant which would replicate it for each position.
 
         Args:
-            pretrained_model ([`GPT2LMHeadModel`]):
+            pretrained_model ([`GPT2ModelBase`]):
                 The pre-trained GPT-2 language model to copy weights from.
 
         Returns:
@@ -530,15 +530,16 @@ class LanguageDiffusionDecoderLMHead(GPT2PreTrainedModel, GenerationMixin):
 
         Example:
             ```python
-            from transformers import GPT2LMHeadModel
+            from transformers import GPT2ModelBase
 
-            pretrained = GPT2LMHeadModel.from_pretrained("gpt2")
+            pretrained = GPT2ModelBase.from_pretrained("gpt2")
             model = LanguageDiffusionDecoderLMHead(config)
             model.init_weight_from_pretrained(pretrained)
             ```
         """
-        self.transformer.init_weight_from_pretrained(pretrained_model=pretrained_model.transformer)
-        self.lm_head = copy.deepcopy(pretrained_model.lm_head)
+        self.transformer.init_weight_from_pretrained(pretrained_model=pretrained_model)
+        with torch.no_grad():
+            self.lm_head.weight.copy_(copy.deepcopy(pretrained_model.wte.weight))
         return self
 
     @auto_docstring(

@@ -812,7 +812,7 @@ class LanguageEncoderLatentHead(GPT2PreTrainedModel, GenerationMixin):
             with torch.no_grad():
                 self.latent_head.weight.copy_(torch.eye(config.n_embd))
         
-    def init_weight_from_pretrained(self, pretrained_model: GPT2LMHeadModel):
+    def init_weight_from_pretrained(self, pretrained_model: GPT2ModelBase):
         """
         Initializes the language encoder from a pre-trained model.
 
@@ -822,10 +822,11 @@ class LanguageEncoderLatentHead(GPT2PreTrainedModel, GenerationMixin):
         Returns:
             A new instance of the class.
         """
-        self.transformer.init_weight_from_pretrained(pretrained_model=pretrained_model.transformer)
+        self.transformer.init_weight_from_pretrained(pretrained_model=pretrained_model)
         # latent_head is not copied from pretrained model since it projects to latent_dim, not vocab_size
         # It will be initialized with random weights
-        self.lm_head = copy.deepcopy(pretrained_model.lm_head)
+        with torch.no_grad():
+            self.lm_head.weight.copy_(copy.deepcopy(pretrained_model.wte.weight))
         return self
 
     @auto_docstring(
@@ -1154,7 +1155,7 @@ class LanguageDecoderLMHead(GPT2PreTrainedModel, GenerationMixin):
         # Initialize weights and apply final processing
         self.post_init()
         
-    def init_weight_from_pretrained(self, pretrained_model: GPT2LMHeadModel):
+    def init_weight_from_pretrained(self, pretrained_model: GPT2ModelBase):
         """
         Initializes the language encoder from a pre-trained model.
 
@@ -1164,9 +1165,10 @@ class LanguageDecoderLMHead(GPT2PreTrainedModel, GenerationMixin):
         Returns:
             A new instance of the class.
         """
-        self.transformer.init_weight_from_pretrained(pretrained_model=pretrained_model.transformer)
-        for i in range(len(self.multi_lm_head)):
-            self.multi_lm_head[i] = copy.deepcopy(pretrained_model.lm_head)
+        self.transformer.init_weight_from_pretrained(pretrained_model=pretrained_model)
+        with torch.no_grad():
+            for i in range(len(self.multi_lm_head)):
+                self.multi_lm_head[i].weight.copy_(copy.deepcopy(pretrained_model.wte.weight))
         return self
 
     def _project_with_multi_heads(self, latents: torch.Tensor) -> torch.Tensor:
@@ -1320,7 +1322,7 @@ class LanguageAutoencoder(GPT2PreTrainedModel, GenerationMixin):
         # Initialize weights and apply final processing
         self.post_init()
 
-    def init_weight_from_pretrained(self, pretrained_model: GPT2LMHeadModel):
+    def init_weight_from_pretrained(self, pretrained_model: GPT2ModelBase):
         """
         Initializes the language encoder from a pre-trained model.
 
