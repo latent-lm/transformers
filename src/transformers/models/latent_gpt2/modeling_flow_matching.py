@@ -666,7 +666,12 @@ class LanguageFlowMatching(GPT2PreTrainedModel, GenerationMixin):
         # print(f"LanguageFlowMatching - inputs_prev_latent: {inputs_prev_latent.shape}")
         # print(f"LanguageFlowMatching - inputs_latent_timestep: {inputs_latent_timestep.shape}")
         # print(f"LanguageFlowMatching - logits: {logits.shape}")
-        estimates = inputs_prev_latent - (inputs_latent_timestep - 1.0) * logits
+        # Since x_t := t x + (1 - (1 - \simga_{min}) t) z
+        # Since v := x - (1 - \sigma_{min}) z
+        # Therefore, x = v + (1 - \sigma_{min}) z = v + (1 - \sigma_{min}) (\frac{x_{t} - t x}{(1 - (1 - \simga_{min}) t)})
+        # CAUTION: Be carefull to the derivation of the estimates
+        # estimates = inputs_prev_latent - (inputs_latent_timestep - 1.0) * logits
+        estimates = inputs_prev_latent +  (1.0 - self.config.fm_min_sigma) * logits / (1.0 - (1.0 - self.config.fm_min_sigma) * inputs_latent_timestep)
         # last_context = transformer_outputs.last_hidden_state[:, :-1, ...]
         # contexts = (s[:, :-1, ...] for s in transformer_outputs.hidden_states)
 
@@ -708,7 +713,7 @@ class LanguageFlowMatching(GPT2PreTrainedModel, GenerationMixin):
         **kwargs,
     ) -> torch.Tensor:
         dim = list(range(1, len(logits.shape)))
-        return torch.norm(logits - labels , dim=dim, p=2).mean()
+        return torch.norm(logits - labels, dim=dim, p=2).mean()
     
     def _get_inputs_outputs(
         self,
@@ -727,15 +732,15 @@ class LanguageFlowMatching(GPT2PreTrainedModel, GenerationMixin):
                 # CAUTION: Expand timestep for broadcasting: (batch_size,) -> (batch_size, 1, 1) for (batch_size, seq_len, hidden_dim), if not, the dimension of inputs_prev_latent will be wrong
                 inputs_latent_timestep = torch.rand(labels.shape[0], 1, 1, device=labels.device)
                 noise = self.transformer._rand_latent(batch_size=labels.shape[0], device=labels.device)
-                inputs_prev_latent = inputs_latent_timestep * labels + (1.0 - inputs_latent_timestep) * noise
+                inputs_prev_latent = inputs_latent_timestep * labels + (1.0 - (1.0 - self.config.fm_min_sigma) * inputs_latent_timestep) * noise
             elif inputs_latent_timestep is not None and inputs_prev_latent is not None:
                 # If both inputs_latent_timestep and inputs_prev_latent are provided, use it for training
                 # CAUTION: Expand timestep for broadcasting: (batch_size,) -> (batch_size, 1, 1) for (batch_size, seq_len, hidden_dim), if not, the dimension of inputs_prev_latent will be wrong
                 inputs_latent_timestep = inputs_latent_timestep.view(-1, 1, 1)
-                noise = (inputs_prev_latent - inputs_latent_timestep * labels) /  (1.0 - inputs_latent_timestep)
+                noise = (inputs_prev_latent - inputs_latent_timestep * labels) /  ((1.0 - (1.0 - self.config.fm_min_sigma) * inputs_latent_timestep))
             else:
                 raise ValueError("Arguements inputs_prev_latent and inputs_latent_timestep should be both provided or not provided.")
-            velocity = labels - noise
+            velocity = labels - (1.0 - self.config.fm_min_sigma) * noise
         else:
             # Inference mode
             velocity = None
@@ -744,7 +749,9 @@ class LanguageFlowMatching(GPT2PreTrainedModel, GenerationMixin):
 
             if inputs_prev_latent is None and inputs_latent_timestep is None:
                 # CAUTION: Expand timestep for broadcasting: (batch_size,) -> (batch_size, 1, 1) for (batch_size, seq_len, hidden_dim), if not, the dimension of inputs_prev_latent will be wrong
-                inputs_latent_timestep = torch.rand(inputs_embeds.shape[0], 1, 1, device=inputs_embeds.device)
+                # inputs_latent_timestep = torch.rand(inputs_embeds.shape[0], 1, 1, device=inputs_embeds.device)
+                # CAUTION: If there is no labels and previous timestep latent, the timestep should use 0
+                inputs_latent_timestep = torch.zeros(inputs_embeds.shape[0], 1, 1, dtype=torch.float32, device=inputs_embeds.device)
                 inputs_prev_latent = self.transformer._rand_latent(batch_size=inputs_embeds.shape[0], device=inputs_embeds.device)
             elif inputs_prev_latent is not None and inputs_latent_timestep is not None:
                 pass
