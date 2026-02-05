@@ -579,8 +579,9 @@ class LanguageFlowMatching(GPT2PreTrainedModel, GenerationMixin):
         Returns:
             A new instance of the class.
         """
-        self.transformer.init_weight_from_pretrained(pretrained_model=pretrained_model.transformer)
-        self.lm_head = copy.deepcopy(pretrained_model.lm_head)
+        self.transformer.init_weight_from_pretrained(pretrained_model=pretrained_model)
+        with torch.no_grad():
+            self.lm_head.weight.copy_(copy.deepcopy(pretrained_model.wte.weight))
         return self
 
     @auto_docstring(
