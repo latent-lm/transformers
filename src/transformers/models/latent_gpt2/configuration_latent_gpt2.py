@@ -105,6 +105,12 @@ class LatentGPT2Config(GPT2Config):
             Window size used by the latent encoder and decoder for aggregating/disaggregating representations.
         latent_dim (`int`, *optional*, defaults to 768):
             The latent dimension of the autoencoder.
+        normalized_latent_sigmoid (`bool`, *optional*, defaults to `False`):
+            Whether to normalize the latent using sigmoid (maps to [-1, 1] via sigmoid(x)*2-1).
+            Mutually exclusive with `normalized_latent_tanh`.
+        normalized_latent_tanh (`bool`, *optional*, defaults to `True`):
+            Whether to normalize the latent using tanh.
+            Mutually exclusive with `normalized_latent_sigmoid`.
         num_hidden_layers_encoder (`int`, *optional*, defaults to 6):
             Number of hidden layers in the latent encoder stack.
         num_hidden_layers_decoder (`int`, *optional*, defaults to 6):
@@ -145,6 +151,8 @@ class LatentGPT2Config(GPT2Config):
         # Latent-specific parameters
         window_size: int = 4,
         latent_dim: int = 768,
+        normalized_latent_sigmoid: bool = False,
+        normalized_latent_tanh: bool = True,
         autoencoder_type: str = "multi_head",
         num_hidden_layers_encoder: int = 6,
         num_hidden_layers_decoder: int = 6,
@@ -168,6 +176,8 @@ class LatentGPT2Config(GPT2Config):
         # Latent architecture parameters
         self.window_size: int = window_size
         self.latent_dim: int = latent_dim
+        self.normalized_latent_sigmoid: bool = normalized_latent_sigmoid
+        self.normalized_latent_tanh: bool = normalized_latent_tanh
 
         # Autoencoder parameters
         self.autoencoder_type: str = autoencoder_type
@@ -186,6 +196,8 @@ class LatentGPT2Config(GPT2Config):
         config: GPT2Config,
         window_size: int = 4,
         latent_dim: int = 768,
+        normalized_latent_sigmoid: bool = False,
+        normalized_latent_tanh: bool = True,
         autoencoder_type: str = "multi_head",
         num_hidden_layers_encoder: int = 6,
         num_hidden_layers_decoder: int = 6,
@@ -206,6 +218,12 @@ class LatentGPT2Config(GPT2Config):
                 The window size for the latent encoder/decoder.
             latent_dim (`int`, *optional*, defaults to 768):
                 The latent dimension of the autoencoder.
+            normalized_latent_sigmoid (`bool`, *optional*, defaults to `False`):
+                Whether to normalize the latent using sigmoid (maps to [-1, 1] via sigmoid(x)*2-1).
+                Mutually exclusive with `normalized_latent_tanh`.
+            normalized_latent_tanh (`bool`, *optional*, defaults to `True`):
+                Whether to normalize the latent using tanh.
+                Mutually exclusive with `normalized_latent_sigmoid`.
             autoencoder_type (`str`, *optional*, defaults to "multi_head"):
                 The type of autoencoder to use. Can be either "multi_head" or "diffusion")
             num_hidden_layers_encoder (`int`, *optional*, defaults to 6):
@@ -242,6 +260,8 @@ class LatentGPT2Config(GPT2Config):
         base_kwargs.update({
             "window_size": window_size,
             "latent_dim": latent_dim,
+            "normalized_latent_sigmoid": normalized_latent_sigmoid,
+            "normalized_latent_tanh": normalized_latent_tanh,
             "autoencoder_type": autoencoder_type,
             "num_hidden_layers_encoder": num_hidden_layers_encoder,
             "num_hidden_layers_decoder": num_hidden_layers_decoder,

@@ -830,8 +830,12 @@ class LanguageEncoderLatentHead(GPT2PreTrainedModel, GenerationMixin):
         return self
     
     def transform_latent(self, latent: torch.FloatTensor) -> torch.FloatTensor:
-        if self.config.normalize_latent:
-            return (nn.Sigmoid(latent) * 2) - 1
+        if self.config.normalized_latent_sigmoid and self.config.normalized_latent_tanh:
+            raise ValueError("Only one latent normalizing trick, normalized_latent_sigmoid or normalized_latent_tanh can be used, not both.")
+        if self.config.normalized_latent_sigmoid:
+            return (torch.sigmoid(latent) * 2) - 1
+        elif self.config.normalized_latent_tanh:
+            return torch.tanh(latent)
         return latent
 
     @auto_docstring(
