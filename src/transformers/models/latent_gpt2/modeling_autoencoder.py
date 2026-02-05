@@ -828,6 +828,11 @@ class LanguageEncoderLatentHead(GPT2PreTrainedModel, GenerationMixin):
         with torch.no_grad():
             self.lm_head.weight.copy_(copy.deepcopy(pretrained_model.wte.weight))
         return self
+    
+    def transform_latent(self, latent: torch.FloatTensor) -> torch.FloatTensor:
+        if self.config.normalize_latent:
+            return (nn.Sigmoid(latent) * 2) - 1
+        return latent
 
     @auto_docstring(
         custom_intro="Forward pass for the language encoder with latent head. Processes input sequences through the encoder and produces both latent representations and vocabulary logits for language modeling.",
@@ -915,8 +920,8 @@ class LanguageEncoderLatentHead(GPT2PreTrainedModel, GenerationMixin):
         
         # Project the latents to logits
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.latent_head(last_tail_hidden_state[:, slice_indices, :])
-        latents = self.latent_head(last_tail_hidden_state)
+        logits = self.transform_latent(self.latent_head(last_tail_hidden_state[:, slice_indices, :]))
+        latents = self.transform_latent(self.latent_head(last_tail_hidden_state))
 
         loss = None
 
