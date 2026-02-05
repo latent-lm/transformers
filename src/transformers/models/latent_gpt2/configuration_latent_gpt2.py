@@ -105,10 +105,12 @@ class LatentGPT2Config(GPT2Config):
             Window size used by the latent encoder and decoder for aggregating/disaggregating representations.
         latent_dim (`int`, *optional*, defaults to 768):
             The latent dimension of the autoencoder.
-        normalized_latent_sigmoid (`bool`, defaults to True):
-                Whether to normalize the latent using sigmoid
-        normalized_latent_tanh (`bool`, defaults to False):
-                Whether to normalize the latent using tanh
+        normalized_latent_sigmoid (`bool`, *optional*, defaults to `False`):
+            Whether to normalize the latent using sigmoid (maps to [-1, 1] via sigmoid(x)*2-1).
+            Mutually exclusive with `normalized_latent_tanh`.
+        normalized_latent_tanh (`bool`, *optional*, defaults to `True`):
+            Whether to normalize the latent using tanh.
+            Mutually exclusive with `normalized_latent_sigmoid`.
         num_hidden_layers_encoder (`int`, *optional*, defaults to 6):
             Number of hidden layers in the latent encoder stack.
         num_hidden_layers_decoder (`int`, *optional*, defaults to 6):
@@ -216,8 +218,12 @@ class LatentGPT2Config(GPT2Config):
                 The window size for the latent encoder/decoder.
             latent_dim (`int`, *optional*, defaults to 768):
                 The latent dimension of the autoencoder.
-            normalized_latent_sigmoid (`bool`, defaults to True):
-                Whether to normalize the latent
+            normalized_latent_sigmoid (`bool`, *optional*, defaults to `False`):
+                Whether to normalize the latent using sigmoid (maps to [-1, 1] via sigmoid(x)*2-1).
+                Mutually exclusive with `normalized_latent_tanh`.
+            normalized_latent_tanh (`bool`, *optional*, defaults to `True`):
+                Whether to normalize the latent using tanh.
+                Mutually exclusive with `normalized_latent_sigmoid`.
             autoencoder_type (`str`, *optional*, defaults to "multi_head"):
                 The type of autoencoder to use. Can be either "multi_head" or "diffusion")
             num_hidden_layers_encoder (`int`, *optional*, defaults to 6):
