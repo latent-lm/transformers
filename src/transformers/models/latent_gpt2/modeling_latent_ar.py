@@ -384,6 +384,289 @@ class LatentAutoregressive(GPT2PreTrainedModel, GenerationMixin):
         **kwargs,
     ) -> Union[tuple, LatentCausalLMOutputWithCrossAttentions]:
         """
+        Forward pass autoencoder and flow matching, take gradients on flow matching, use end-to-end loss
+        Assume inputs have one less chunk than labels
+        """
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        # Extract last self.config.window_size tokens as target, the remaining as context. Pad the context to make it divisible to self.config.window_size
+        # Treat the last chunk of the input sequence as target
+        if labels is not None:
+            labels_target = labels[..., -self.config.window_size:]
+            
+        is_autoencoder_training: bool = self.autoencoder.training
+        # Freeze autoencoder
+        # CAUTION: The self.autoencoder would be freezed 
+        self.autoencoder = self.autoencoder.eval()
+
+        # with torch.no_grad():
+        encoder_output = self.autoencoder.encode(
+            input_ids=input_ids,
+            past_key_values=None,
+            cache_position=None,
+            attention_mask=None,
+            token_type_ids=None,
+            position_ids=None,
+            inputs_embeds=inputs_embeds,
+            encoder_hidden_states=None,
+            encoder_attention_mask=None,
+            labels=None,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=True,
+            logits_to_keep=0,
+        )
+        
+        fm_output = self.fm(
+            inputs_prev_latent=None,
+            inputs_latent_timestep=None,
+            input_ids=None,
+            past_key_values=None,
+            cache_position=None,
+            attention_mask=None,
+            token_type_ids=None,
+            position_ids=None,
+            inputs_embeds=encoder_output.latents[:, :-1, ...],
+            encoder_hidden_states=None,
+            encoder_attention_mask=None,
+            labels=encoder_output.latents[:, -1:, ...],
+            use_cache=None,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=True,
+            logits_to_keep=0,
+        )
+        # with torch.no_grad():
+        decoder_output = self.autoencoder.decode(
+            input_ids=None,
+            # CAUTION: Pass latent into inputs_latents, not inputs_embeds
+            inputs_latents=fm_output.estimates,
+            past_key_values=None,
+            cache_position=None,
+            attention_mask=None,
+            token_type_ids=None,
+            position_ids=None,
+            inputs_embeds=None,
+            encoder_hidden_states=None,
+            encoder_attention_mask=None,
+            labels=None,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=True,
+            logits_to_keep=0,
+        )
+        
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        # logits = self.lm_head(decoder_output.hidden_states[:, slice_indices, :])
+        logits = decoder_output.logits[:, slice_indices, :]
+
+        # loss = fm_output.loss
+        loss = None
+        if labels is not None:
+            # Flatten the tokens
+            loss = self.loss_function(
+                # Skip the logit at the first dimension, which is the output corresponsing to the latent
+                logits=logits,
+                labels=labels_target,
+                vocab_size=self.config.vocab_size,
+                **kwargs,
+            )
+
+        latent_lm_output = LatentCausalLMOutputWithCrossAttentions(
+            last_tail_hidden_state=decoder_output.last_tail_hidden_state if output_hidden_states else None,
+            last_hidden_state=decoder_output.last_hidden_state if output_hidden_states else None,
+            loss=loss,
+            logits=logits,
+            past_key_values=decoder_output.past_key_values,
+            hidden_states=decoder_output.hidden_states if output_hidden_states else None,
+            attentions=decoder_output.attentions if output_attentions else None,
+            cross_attentions=decoder_output.cross_attentions if output_attentions else None,
+            latents=encoder_output.latents,
+        )
+        
+        # Recover the trainable state
+        if is_autoencoder_training:
+            self.autoencoder = self.autoencoder.train()
+        
+        if not return_dict:
+            output = (logits,) + decoder_output[1:]
+            return ((loss,) + output) if loss is not None else output
+
+        # When return_encoder_decoder_res=True, return tuple of (ar_outputs, ltar_output, encoder_output)
+        if return_encoder_decoder_res:
+            # ltar_output is the latent AR prediction (placeholder: using encoder_output for now)
+            # encoder_output contains the actual encoder latents
+            ret_encoder_output = self._format_autoencoder_dict_output(dict_output=encoder_output, output_attentions=output_attentions, output_hidden_states=output_hidden_states)
+            ret_decoder_output = self._format_autoencoder_dict_output(dict_output=decoder_output, output_attentions=output_attentions, output_hidden_states=output_hidden_states)
+            return (latent_lm_output, ret_encoder_output, ret_decoder_output)
+        return latent_lm_output
+    
+    def forward_combined_fm(
+        self,
+        inputs_prev_latent: Optional[torch.FloatTensor] = None,
+        inputs_latent_timestep: Optional[torch.FloatTensor] = None,
+        input_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        token_type_ids: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        return_encoder_decoder_res: bool = False,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        **kwargs,
+    ) -> Union[tuple, LatentCausalLMOutputWithCrossAttentions]:
+        """
+        Forward pass autoencoder and flow matching, take gradients on flow matching, use end-to-end and FM losses
+        Assume inputs have one less chunk than labels
+        """
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        # Extract last self.config.window_size tokens as target, the remaining as context. Pad the context to make it divisible to self.config.window_size
+        # Treat the last chunk of the input sequence as target
+        if labels is not None:
+            labels_target = labels[..., -self.config.window_size:]
+            
+        is_autoencoder_training: bool = self.autoencoder.training
+        # Freeze autoencoder
+        # CAUTION: The self.autoencoder would be freezed 
+        self.autoencoder = self.autoencoder.eval()
+
+        # with torch.no_grad():
+        encoder_output = self.autoencoder.encode(
+            input_ids=input_ids,
+            past_key_values=None,
+            cache_position=None,
+            attention_mask=None,
+            token_type_ids=None,
+            position_ids=None,
+            inputs_embeds=inputs_embeds,
+            encoder_hidden_states=None,
+            encoder_attention_mask=None,
+            labels=None,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=True,
+            logits_to_keep=0,
+        )
+        
+        fm_output = self.fm(
+            inputs_prev_latent=None,
+            inputs_latent_timestep=None,
+            input_ids=None,
+            past_key_values=None,
+            cache_position=None,
+            attention_mask=None,
+            token_type_ids=None,
+            position_ids=None,
+            inputs_embeds=encoder_output.latents[:, :-1, ...],
+            encoder_hidden_states=None,
+            encoder_attention_mask=None,
+            labels=encoder_output.latents[:, -1:, ...],
+            use_cache=None,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=True,
+            logits_to_keep=0,
+        )
+        # with torch.no_grad():
+        decoder_output = self.autoencoder.decode(
+            input_ids=None,
+            # CAUTION: Pass latent into inputs_latents, not inputs_embeds
+            inputs_latents=fm_output.estimates,
+            past_key_values=None,
+            cache_position=None,
+            attention_mask=None,
+            token_type_ids=None,
+            position_ids=None,
+            inputs_embeds=None,
+            encoder_hidden_states=None,
+            encoder_attention_mask=None,
+            labels=None,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=True,
+            logits_to_keep=0,
+        )
+        
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        # logits = self.lm_head(decoder_output.hidden_states[:, slice_indices, :])
+        logits = decoder_output.logits[:, slice_indices, :]
+
+        loss = fm_output.loss
+        if labels is not None:
+            # Flatten the tokens
+            loss += self.loss_function(
+                # Skip the logit at the first dimension, which is the output corresponsing to the latent
+                logits=logits,
+                labels=labels_target,
+                vocab_size=self.config.vocab_size,
+                **kwargs,
+            )
+
+        latent_lm_output = LatentCausalLMOutputWithCrossAttentions(
+            last_tail_hidden_state=decoder_output.last_tail_hidden_state if output_hidden_states else None,
+            last_hidden_state=decoder_output.last_hidden_state if output_hidden_states else None,
+            loss=loss,
+            logits=logits,
+            past_key_values=decoder_output.past_key_values,
+            hidden_states=decoder_output.hidden_states if output_hidden_states else None,
+            attentions=decoder_output.attentions if output_attentions else None,
+            cross_attentions=decoder_output.cross_attentions if output_attentions else None,
+            latents=encoder_output.latents,
+        )
+        
+        # Recover the trainable state
+        if is_autoencoder_training:
+            self.autoencoder = self.autoencoder.train()
+        
+        if not return_dict:
+            output = (logits,) + decoder_output[1:]
+            return ((loss,) + output) if loss is not None else output
+
+        # When return_encoder_decoder_res=True, return tuple of (ar_outputs, ltar_output, encoder_output)
+        if return_encoder_decoder_res:
+            # ltar_output is the latent AR prediction (placeholder: using encoder_output for now)
+            # encoder_output contains the actual encoder latents
+            ret_encoder_output = self._format_autoencoder_dict_output(dict_output=encoder_output, output_attentions=output_attentions, output_hidden_states=output_hidden_states)
+            ret_decoder_output = self._format_autoencoder_dict_output(dict_output=decoder_output, output_attentions=output_attentions, output_hidden_states=output_hidden_states)
+            return (latent_lm_output, ret_encoder_output, ret_decoder_output)
+        return latent_lm_output
+    
+    def forward_single_forward(
+        self,
+        inputs_prev_latent: Optional[torch.FloatTensor] = None,
+        inputs_latent_timestep: Optional[torch.FloatTensor] = None,
+        input_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        token_type_ids: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        return_encoder_decoder_res: bool = False,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        **kwargs,
+    ) -> Union[tuple, LatentCausalLMOutputWithCrossAttentions]:
+        """
         Forward pass latent flow matching end-to-end, take gradients on flow matching, use end-to-end loss
         Assume inputs have one less chunk than labels
         """
@@ -598,83 +881,38 @@ class LatentAutoregressive(GPT2PreTrainedModel, GenerationMixin):
         """
         if forward_type is None:
            forward_type = self.forward_type
+           
+        input_kwagrs = {
+            "input_ids": input_ids,
+            "past_key_values": past_key_values,
+            "cache_position": cache_position,
+            "attention_mask": attention_mask,
+            "token_type_ids": token_type_ids,
+            "position_ids": position_ids,
+            "inputs_embeds": inputs_embeds,
+            "encoder_hidden_states": encoder_hidden_states,
+            "encoder_attention_mask": encoder_attention_mask,
+            "labels": labels,
+            "use_cache": use_cache,
+            "output_attentions": output_attentions,
+            "output_hidden_states": output_hidden_states,
+            "return_dict": return_dict,
+            "logits_to_keep": logits_to_keep,
+            **kwargs
+        }
  
         if forward_type == "autoencoder_fm":
-            return self.forward_autoencoder_fm(
-                input_ids=input_ids,
-                past_key_values=past_key_values,
-                cache_position=cache_position,
-                attention_mask=attention_mask,
-                token_type_ids=token_type_ids,
-                position_ids=position_ids,
-                inputs_embeds=inputs_embeds,
-                encoder_hidden_states=encoder_hidden_states,
-                encoder_attention_mask=encoder_attention_mask,
-                labels=labels,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-                logits_to_keep=logits_to_keep,
-                **kwargs
-            )
+            return self.forward_autoencoder_fm(**input_kwagrs)
         elif forward_type == "fm":
-            return self.forward_fm(
-                input_ids=input_ids,
-                past_key_values=past_key_values,
-                cache_position=cache_position,
-                attention_mask=attention_mask,
-                token_type_ids=token_type_ids,
-                position_ids=position_ids,
-                inputs_embeds=inputs_embeds,
-                encoder_hidden_states=encoder_hidden_states,
-                encoder_attention_mask=encoder_attention_mask,
-                labels=labels,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-                logits_to_keep=logits_to_keep,
-                **kwargs
-            )
+            return self.forward_fm(**input_kwagrs)
         elif forward_type == "latent_fm":
-            return self.forward_latent_fm(
-                input_ids=input_ids,
-                past_key_values=past_key_values,
-                cache_position=cache_position,
-                attention_mask=attention_mask,
-                token_type_ids=token_type_ids,
-                position_ids=position_ids,
-                inputs_embeds=inputs_embeds,
-                encoder_hidden_states=encoder_hidden_states,
-                encoder_attention_mask=encoder_attention_mask,
-                labels=labels,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-                logits_to_keep=logits_to_keep,
-                **kwargs
-            )
+            return self.forward_latent_fm(**input_kwagrs)
+        elif forward_type == "combined_fm":
+            return self.forward_combined_fm(**input_kwagrs)
+        elif forward_type == "single_forward":
+            return self.forward_single_forward(**input_kwagrs)
         elif forward_type == "autoencoder":
-            return self.forward_autoencoder(
-                input_ids=input_ids,
-                past_key_values=past_key_values,
-                cache_position=cache_position,
-                attention_mask=attention_mask,
-                token_type_ids=token_type_ids,
-                position_ids=position_ids,
-                inputs_embeds=inputs_embeds,
-                encoder_hidden_states=encoder_hidden_states,
-                encoder_attention_mask=encoder_attention_mask,
-                labels=labels,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-                logits_to_keep=logits_to_keep,
-                **kwargs
-            )
+            return self.forward_autoencoder(**input_kwagrs)
         else:
             raise NotImplementedError(f"forward_type = {forward_type} is not supported.")
 
