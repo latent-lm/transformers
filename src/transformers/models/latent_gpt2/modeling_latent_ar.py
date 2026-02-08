@@ -192,16 +192,16 @@ class LatentAutoregressive(GPT2PreTrainedModel, GenerationMixin):
         # logits = self.lm_head(decoder_output.hidden_states[:, slice_indices, :])
         logits = decoder_output.logits[:, slice_indices, :]
 
-        loss = None
+        loss = fm_output.loss
         if labels is not None:
             # Flatten the tokens
-            loss = self.loss_function(
+            loss += self.config.la_fm_end2end_loss_weight * self.loss_function(
                 # Skip the logit at the first dimension, which is the output corresponsing to the latent
                 logits=logits,
                 labels=labels_target,
                 vocab_size=self.config.vocab_size,
                 **kwargs,
-            ) + ae_output.loss
+            ) + self.config.la_ae_reconst_loss_weight * ae_output.loss
 
         latent_lm_output = LatentCausalLMOutputWithCrossAttentions(
             last_tail_hidden_state=decoder_output.last_tail_hidden_state if output_hidden_states else None,
@@ -607,7 +607,7 @@ class LatentAutoregressive(GPT2PreTrainedModel, GenerationMixin):
         loss = fm_output.loss
         if labels is not None:
             # Flatten the tokens
-            loss += self.loss_function(
+            loss += self.config.la_fm_end2end_loss_weight * self.loss_function(
                 # Skip the logit at the first dimension, which is the output corresponsing to the latent
                 logits=logits,
                 labels=labels_target,

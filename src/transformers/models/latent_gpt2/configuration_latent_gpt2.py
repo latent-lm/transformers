@@ -164,6 +164,9 @@ class LatentGPT2Config(GPT2Config):
         # Flow matching parameters
         fm_min_sigma: float = 0.01,
         fm_num_train_timesteps: int = 1000,
+        # Loss weights
+        la_fm_end2end_loss_weight: float = 0.0,
+        la_ae_reconst_loss_weight: float = 1.0,
         # All GPT2Config parameters passed via kwargs
         **kwargs,
     ) -> None:
@@ -189,6 +192,9 @@ class LatentGPT2Config(GPT2Config):
         self.num_hidden_layers_fm: int = num_hidden_layers_fm
         self.fm_min_sigma: float = fm_min_sigma
         self.fm_num_train_timesteps: int = fm_num_train_timesteps
+        # Loss weights
+        self.la_fm_end2end_loss_weight: float = la_fm_end2end_loss_weight
+        self.la_ae_reconst_loss_weight: float = la_ae_reconst_loss_weight
 
     @classmethod
     def build_from_pretrained(
@@ -207,6 +213,8 @@ class LatentGPT2Config(GPT2Config):
         dae_num_train_timesteps: int = 0,
         fm_min_sigma: float = 0.01,
         fm_num_train_timesteps: int = 1000,
+        la_fm_end2end_loss_weight: float = 0.0,
+        la_ae_reconst_loss_weight: float = 1.0,
     ) -> "LatentGPT2Config":
         """
         Builds a new instance of the LatentGPT2Config from a pre-trained GPT2Config.
@@ -271,6 +279,8 @@ class LatentGPT2Config(GPT2Config):
             "dae_num_train_timesteps": dae_num_train_timesteps,
             "fm_min_sigma": fm_min_sigma,
             "fm_num_train_timesteps": fm_num_train_timesteps,
+            "la_fm_end2end_loss_weight": la_fm_end2end_loss_weight,
+            "la_ae_reconst_loss_weight": la_ae_reconst_loss_weight,
         })
 
         return cls(**base_kwargs)
