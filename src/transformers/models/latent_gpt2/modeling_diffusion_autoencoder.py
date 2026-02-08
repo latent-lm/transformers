@@ -726,7 +726,7 @@ class LanguageDiffusionAutoencoder(GPT2PreTrainedModel, GenerationMixin):
         ```
     """
     # Tieing weights doesn't work
-    _tied_weights_keys = {"encoder.latent_head.weight": "decoder.transformer.wte_latent.weight"}
+    _tied_weights_keys = {"encoder.transformer.wte.weight": "decoder.transformer.lm_head.weight"}
 
     def __init__(self, config: LatentGPT2Config):
         """
